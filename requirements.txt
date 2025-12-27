@@ -1,5 +1,8 @@
 groq
 tqdm
+uvicorn
+fastapi
+pydantic
 requests
 chromadb
 python-dotenv

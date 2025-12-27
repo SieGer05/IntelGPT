@@ -1,0 +1,5 @@
+@import "tailwindcss";
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { @apply bg-[#202021]; }
+::-webkit-scrollbar-thumb { @apply bg-[#303131] rounded; }
