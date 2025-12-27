@@ -12,3 +12,7 @@ __pycache__/
 
 # Environment variables
 .env
+
+# ChromaDB / vector databases
+chroma_db/
+*.sqlite3
