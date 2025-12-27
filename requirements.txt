@@ -1,4 +1,6 @@
+groq
 tqdm
 requests
 chromadb
+python-dotenv
 sentence-transformers
