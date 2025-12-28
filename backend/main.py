@@ -3,6 +3,7 @@ import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List 
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
@@ -51,8 +52,13 @@ async def startup_event():
    print("[READY] API is ready to accept requests.")
 
 # DATA MODELS 
+class Message(BaseModel):
+   role: str
+   content: str
+
 class QueryRequest(BaseModel):
    query: str
+   history: List[Message] = []
 
 class QueryResponse(BaseModel):
    answer: str
@@ -63,6 +69,8 @@ class QueryResponse(BaseModel):
 async def chat_endpoint(request: QueryRequest):
    try:
       user_query = request.query.strip()
+      history = request.history
+
       if not user_query:
          raise HTTPException(status_code=400, detail="Query cannot be empty")
       
@@ -102,7 +110,6 @@ async def chat_endpoint(request: QueryRequest):
       system_prompt = ""
 
       # Step 2: Branching
-
       if intent == "technical":
          # >> PATH A: TECHNICAL (RAG)
          print("[PATH] Technical Query -> Searching Database...")
@@ -138,14 +145,23 @@ async def chat_endpoint(request: QueryRequest):
          print("[PATH] General Query -> Skipping Database.")
          system_prompt = "You are a helpful Cyber Security Assistant. Be polite, professional, and concise. Do not make up technical facts."
       
-      # Step 3: Generation
+      # Step 3: Generation WITH MEMORY
+      # 1. On commence par le Prompt Système
+      messages_payload = [
+         {"role": "system", "content": system_prompt}
+      ]
+      
+      # 2. On insère l'historique (les 6 derniers messages envoyés par le frontend)
+      for msg in history:
+         messages_payload.append({"role": msg.role, "content": msg.content})
+          
+      # 3. On ajoute la question actuelle de l'utilisateur
+      messages_payload.append({"role": "user", "content": user_query})
+
       chat_completion = groq_client.chat.completions.create(
-         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}
-         ],
+         messages=messages_payload, 
          model=GROQ_MODEL,
-         temperature=0.0, # Keep it precise
+         temperature=0.0,
       )
 
       response_text = chat_completion.choices[0].message.content

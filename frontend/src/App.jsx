@@ -9,7 +9,6 @@ import { ShieldCheck, PanelLeftOpen } from 'lucide-react';
 function App() {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
-  
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   
   const messagesEndRef = useRef(null);
@@ -19,11 +18,15 @@ function App() {
   }, [messages]);
 
   const handleSend = async (text) => {
+    // On capture l'historique ACTUEL avant d'ajouter le nouveau message
+    const currentHistory = messages;
+
     setMessages(prev => [...prev, { role: 'user', content: text }]);
     setLoading(true);
 
     try {
-      const data = await chatService.sendMessage(text);
+      const data = await chatService.sendMessage(text, currentHistory);
+      
       setMessages(prev => [...prev, { 
         role: 'assistant', 
         content: data.answer, 
@@ -42,7 +45,6 @@ function App() {
 
   return (
     <div className="flex h-screen bg-[#202021] text-white font-sans overflow-hidden">
-      
       <Sidebar 
         onReset={() => setMessages([])} 
         isOpen={isSidebarOpen} 
@@ -55,7 +57,7 @@ function App() {
           <div className="absolute top-4 left-4 z-10">
             <button 
               onClick={() => setIsSidebarOpen(true)}
-              className="p-2 bg-[#202021] text-gray-400 hover:text-white rounded-md shadow-md transition-all cursor-e-resize"
+              className="p-2 bg-[#202021] text-gray-400 hover:text-white rounded-md shadow-md transition-all border border-gray-700 cursor-pointer"
               title="Open Sidebar"
             >
               <PanelLeftOpen size={20} />
@@ -75,11 +77,11 @@ function App() {
             </div>
             
             <div className="mt-8 grid grid-cols-1 md:grid-cols-2 gap-3 max-w-2xl w-full">
-                <button onClick={() => handleSend("What is Phishing?")} className="p-4 bg-[#2f2f2f] rounded-xl hover:bg-[#424242] transition-colors text-sm text-gray-300 text-left cursor-pointer">
+                <button onClick={() => handleSend("What is Phishing?")} className="p-4 bg-[#2f2f2f] rounded-xl hover:bg-[#424242] transition-colors text-sm text-gray-300 text-left cursor-pointer border border-transparent hover:border-gray-600">
                   <span className="font-medium block mb-1">What is Phishing?</span>
                   <span className="text-gray-500 text-xs">Learn about email attacks</span>
                 </button>
-                <button onClick={() => handleSend("List MITRE techniques for Linux")} className="p-4 bg-[#2f2f2f] rounded-xl hover:bg-[#424242] transition-colors text-sm text-gray-300 text-left cursor-pointer">
+                <button onClick={() => handleSend("List MITRE techniques for Linux")} className="p-4 bg-[#2f2f2f] rounded-xl hover:bg-[#424242] transition-colors text-sm text-gray-300 text-left cursor-pointer border border-transparent hover:border-gray-600">
                   <span className="font-medium block mb-1">Linux Techniques</span>
                   <span className="text-gray-500 text-xs">Explore MITRE ATT&CK</span>
                 </button>
