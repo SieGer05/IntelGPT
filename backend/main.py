@@ -112,10 +112,43 @@ async def chat_endpoint(request: QueryRequest):
       # Step 2: Branching
       if intent == "technical":
          # >> PATH A: TECHNICAL (RAG)
-         print("[PATH] Technical Query -> Searching Database...")
+         
+         # --- ENHANCEMENT START: Contextualization ---
+         # Default search query is the user query
+         search_query = user_query
+         
+         # If we have history, rewrite the query to include context
+         if history:
+            print("[REWRITE] Contextualizing query based on history...")
+            history_block = "\n".join([f"{msg.role}: {msg.content}" for msg in history])
+            
+            rewrite_prompt = f"""
+            Given the conversation history, rewrite the user's last query to be a standalone search query.
+            Replace pronouns (like "it", "this attack", "that") with the specific terms from the history.
+            Output ONLY the rewritten query string. Nothing else.
+            
+            History:
+            {history_block}
+            
+            User Query: {user_query}
+            
+            Rewritten Query:
+            """
+            
+            rewrite_completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": rewrite_prompt}],
+            model=GROQ_MODEL,
+            temperature=0.1
+            )
+            
+            search_query = rewrite_completion.choices[0].message.content.strip()
+            print(f"[REWRITE] Original: '{user_query}' -> New: '{search_query}'")
+         # --- ENHANCEMENT END ---
+
+         print(f"[PATH] Technical Query -> Searching Database for: {search_query}")
 
          # Retrieval
-         query_vector = embedding_model.encode([user_query]).tolist()
+         query_vector = embedding_model.encode([search_query]).tolist()
          results = collection.query(query_embeddings=query_vector, n_results=3)
 
          if results['documents'] and results['documents'][0]:
