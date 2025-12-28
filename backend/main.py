@@ -1,4 +1,5 @@
 import os
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -64,28 +65,64 @@ async def chat_endpoint(request: QueryRequest):
       user_query = request.query.strip()
       if not user_query:
          raise HTTPException(status_code=400, detail="Query cannot be empty")
+      
+      # Step 1: ROUTER (THE BRAIN) 
+      print(f"[ROUTER] Analyzing intent for: {user_query}")
+      router_prompt = f"""
+         Analyze the following user query: "{user_query}"
+         
+         Return a JSON object with these fields:
+         1. "intent": "technical" (if it's about cybersecurity, attacks, MITRE, or definitions) OR "general" (if it's greeting, small talk, or thanks).
+         2. "safe": true (if safe) or false (if asking for malware code/exploits).
+         
+         Example JSON: {{"intent": "general", "safe": true}}
+      """
 
-      # 1. RETRIEVAL
-      print(f"[SEARCH] Analyzing: {user_query}")
-      query_vector = embedding_model.encode([user_query]).tolist()
-      results = collection.query(query_embeddings=query_vector, n_results=3)
+      router_completion = groq_client.chat.completions.create(
+         messages=[
+            {"role": "system", "content": "You are a helpful classifier. Output JSON only."},
+            {"role": "user", "content": router_prompt}
+         ],
+         model=GROQ_MODEL,
+         response_format={"type": "json_object"}
+      )
 
+      analysis = json.loads(router_completion.choices[0].message.content)
+      intent = analysis.get("intent", "general")
+      is_safe = analysis.get("safe", True)
+
+      if not is_safe:
+         return QueryResponse(
+            answer="I cannot fulfill this request because it violates safety guidelines regarding exploit generation.",
+            sources=[]
+         )
+      
       context_text = ""
       sources = []
+      system_prompt = ""
 
-      if results['documents'] and results['documents'][0]:
-         for i in range(len(results['documents'][0])):
-            doc = results['documents'][0][i]
-            meta = results['metadatas'][0][i]
-            
-            source_id = f"{meta['name']} ({meta.get('external_id', 'N/A')})"
-            sources.append(source_id)
-            context_text += f"---\nSOURCE: {source_id}\nCONTENT: {doc}\n"
-      else:
-         context_text = "No specific cybersecurity documents found in database."
+      # Step 2: Branching
 
-      # 2. GENERATION 
-      system_prompt = f"""
+      if intent == "technical":
+         # >> PATH A: TECHNICAL (RAG)
+         print("[PATH] Technical Query -> Searching Database...")
+
+         # Retrieval
+         query_vector = embedding_model.encode([user_query]).tolist()
+         results = collection.query(query_embeddings=query_vector, n_results=3)
+
+         if results['documents'] and results['documents'][0]:
+            for i in range(len(results['documents'][0])):
+               doc = results['documents'][0][i]
+               meta = results['metadatas'][0][i]
+               
+               source_id = f"{meta['name']} ({meta.get('external_id', 'N/A')})"
+               sources.append(source_id)
+               context_text += f"---\nSOURCE: {source_id}\nCONTENT: {doc}\n"
+         else:
+            context_text = "No specific cybersecurity documents found in database."
+         
+         system_prompt = f"""
          You are a Cyber Threat Intelligence Expert.
          Use ONLY the following context to answer the user's question.
          If the answer is not in the context, say "I don't have enough information in my database."
@@ -94,22 +131,28 @@ async def chat_endpoint(request: QueryRequest):
          {context_text}
          
          Keep the answer technical, concise, and structured.
-      """
-
+         """
+      
+      else:
+         # >> PATH B: GENERAL (Chit-Chat)
+         print("[PATH] General Query -> Skipping Database.")
+         system_prompt = "You are a helpful Cyber Security Assistant. Be polite, professional, and concise. Do not make up technical facts."
+      
+      # Step 3: Generation
       chat_completion = groq_client.chat.completions.create(
          messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query}
          ],
          model=GROQ_MODEL,
-         temperature=0.0,
+         temperature=0.0, # Keep it precise
       )
 
       response_text = chat_completion.choices[0].message.content
 
       return QueryResponse(
          answer=response_text,
-         sources=sources
+         sources=sources 
       )
 
    except Exception as e:
