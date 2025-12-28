@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/intelGPT.png" alt="intelGPT Logo" width="200"/>
+  <img src="./Docs/intelGPT.png" alt="intelGPT Logo" width="200"/>
 </p>
 
 <h1 align="center">I N T E L G P T</h1>
