@@ -51,7 +51,6 @@ function App() {
 
       <div className="flex-1 flex flex-col relative h-full">
         
-        {/* 3. Button to Open Sidebar (Visible only when sidebar is closed) */}
         {!isSidebarOpen && (
           <div className="absolute top-4 left-4 z-10">
             <button 
@@ -67,10 +66,8 @@ function App() {
         {messages.length === 0 ? (
           <div className="flex-1 flex flex-col justify-center items-center p-4">
             
-            {/* Logo and Title */}
             <div className="mb-8 flex flex-col items-center">
-               {/* Optional: Add Logo here if needed, or keep just text */}
-               <h1 className="text-3xl font-semibold text-gray-200">What’s on the agenda today?</h1>
+              <h1 className="text-3xl font-semibold text-gray-200">What’s on the agenda today?</h1>
             </div>
 
             <div className="w-full max-w-2xl">
