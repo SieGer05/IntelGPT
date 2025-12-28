@@ -33,6 +33,36 @@ To make the RAG pipeline more secure and reliable, intelGPT implements several d
 
 3.  **Sanitized Memory Window:** The conversation history uses a "Sliding Window" approach. Only the most recent relevant context is retained, and it is sanitized to prevent prompt pollution or token overflow attacks.
 
+## **Gallery**
+
+**Persona & Chit-Chat**
+<br>
+<img src="./Docs/01.chit-chat.png" alt="Chit Chat" width="100%"/>
+<br>
+
+**RAG: Technical Query (MITRE T1041)**
+<br>
+<img src="./Docs/02.rag-test.png" alt="RAG Test" width="100%"/>
+<br>
+
+**Memory: Context Retention**
+<br>
+<img src="./Docs/03.memory-context1.png" alt="Memory Context 1" width="100%"/>
+<br>
+
+**Memory: Follow-up Questions**
+<br>
+<img src="./Docs/04.memory-context2.png" alt="Memory Context 2" width="100%"/>
+<br>
+
+**Security: Malicious Request Blocked**
+<br>
+<img src="./Docs/05.test-security.png" alt="Security Guardrails" width="100%"/>
+<br>
+
+**Anti-Hallucination: Unknown Tech**
+<br>
+<img src="./Docs/06.test-Hallucination.png" alt="Hallucination Test" width="100%"/>
 
 ## **Installation Guide**
 
