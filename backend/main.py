@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -147,9 +148,43 @@ async def chat_endpoint(request: QueryRequest):
 
          print(f"[PATH] Technical Query -> Searching Database for: {search_query}")
 
-         # Retrieval
+         # --- SMART RETRIEVAL LOGIC START ---
+         # Detect specific IDs (CVE or MITRE) to use deterministic filtering
+         cve_match = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
+         mitre_match = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
+         
+         where_filter = None
+         
+         if cve_match:
+            target_id = cve_match.group(1).upper()
+            print(f"[SMART SEARCH] Exact CVE detected: {target_id}")
+            where_filter = {"external_id": target_id}
+             
+         elif mitre_match:
+            target_id = mitre_match.group(1).upper()
+            print(f"[SMART SEARCH] Exact MITRE ID detected: {target_id}")
+            where_filter = {"external_id": target_id}
+
+         # Prepare Vector Search
          query_vector = embedding_model.encode([search_query]).tolist()
-         results = collection.query(query_embeddings=query_vector, n_results=3)
+         results = {'documents': [], 'metadatas': []}
+
+         # Execute Query
+         if where_filter:
+            # Case 1: Smart Filter Active
+            results = collection.query(
+               query_embeddings=query_vector, 
+               n_results=5, 
+               where=where_filter
+            )
+            # Fallback if filter returns nothing (e.g. typo in ID or ID not in DB)
+            if not results['documents'] or not results['documents'][0]:
+               print("[SMART SEARCH] ID not found in DB, falling back to semantic search...")
+               results = collection.query(query_embeddings=query_vector, n_results=10)
+         else:
+            # Case 2: Standard Semantic Search (Broad search)
+            results = collection.query(query_embeddings=query_vector, n_results=10)
+         # --- SMART RETRIEVAL LOGIC END ---
 
          if results['documents'] and results['documents'][0]:
             for i in range(len(results['documents'][0])):
@@ -157,7 +192,9 @@ async def chat_endpoint(request: QueryRequest):
                meta = results['metadatas'][0][i]
                
                source_id = f"{meta['name']} ({meta.get('external_id', 'N/A')})"
-               sources.append(source_id)
+               # Prevent duplicates in source list
+               if source_id not in sources:
+                  sources.append(source_id)
                context_text += f"---\nSOURCE: {source_id}\nCONTENT: {doc}\n"
          else:
             context_text = "No specific cybersecurity documents found in database."
@@ -201,7 +238,7 @@ async def chat_endpoint(request: QueryRequest):
 
       return QueryResponse(
          answer=response_text,
-         sources=sources 
+         sources=sources[:5] 
       )
 
    except Exception as e:
