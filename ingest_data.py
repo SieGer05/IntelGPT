@@ -41,7 +41,8 @@ def print_status(message, type="info"):
 # CONFIGURATION
 MODEL_NAME = "all-MiniLM-L6-v2"
 MITRE_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
-DB_PATH = "./chroma_db"
+CISA_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+DB_PATH = "./chroma_db" 
 COLLECTION_NAME = "mitre_attack"
 BATCH_SIZE = 100
 
@@ -51,12 +52,25 @@ def download_mitre_data():
       response = requests.get(MITRE_URL, timeout=30)
       if response.status_code != 200:
          raise RuntimeError(f"Server returned status code: {response.status_code}")
-      print_status("Dataset downloaded successfully.", "success")
+      print_status("MITRE Dataset downloaded successfully.", "success")
       return response.json()
    
    except Exception as e:
-      print_status(f"Failed to download data: {e}", "error")
+      print_status(f"Failed to download MITRE data: {e}", "error")
       sys.exit(1)
+
+def download_cisa_data():
+   print_status("Contacting CISA servers...", "info")
+   try:
+      response = requests.get(CISA_URL, timeout=30)
+      if response.status_code != 200:
+         raise RuntimeError(f"Server returned status code: {response.status_code}")
+      print_status("CISA KEV Dataset downloaded successfully.", "success")
+      return response.json()
+   
+   except Exception as e:
+      print_status(f"Failed to download CISA data: {e}", "error")
+      return None
 
 def process_data(mitre_data):
    print_status("Parsing MITRE STIX objects...", "process")
@@ -74,20 +88,17 @@ def process_data(mitre_data):
       name = obj.get("name", "Unknown technique")
       description = obj.get("description", "No description available.")
       
-      # (e.g., T1059)
       external_id = "UNKNOWN"
       for ref in obj.get("external_references", []):
          if ref.get("source_name") == "mitre-attack":
             external_id = ref.get("external_id", "UNKNOWN")
             break
 
-      # Unique ID combining External ID and internal UUID to avoid collisions
       unique_id = f"{external_id}_{obj.get('id')}"
 
       tactics = [phase.get("phase_name") for phase in obj.get("kill_chain_phases", [])]
       platforms = obj.get("x_mitre_platforms", [])
 
-      # Rich context text for the LLM
       full_text = (
          f"MITRE ATT&CK Technique\n"
          f"ID: {external_id}\n"
@@ -108,29 +119,76 @@ def process_data(mitre_data):
          "source": "MITRE ATT&CK"
       })
 
-   print_status(f"Processed {len(documents)} valid techniques.", "success")
+   print_status(f"Processed {len(documents)} MITRE techniques.", "success")
+   return documents, ids, metadatas
+
+def process_cisa_data(cisa_data):
+   if not cisa_data:
+      return [], [], []
+      
+   print_status("Parsing CISA KEV vulnerabilities...", "process")
+
+   documents = []
+   ids = []
+   metadatas = []
+
+   vulnerabilities = cisa_data.get("vulnerabilities", [])
+
+   for vuln in vulnerabilities:
+      cve_id = vuln.get("cveID")
+      vendor = vuln.get("vendorProject")
+      product = vuln.get("product")
+      name = vuln.get("vulnerabilityName")
+      description = vuln.get("shortDescription")
+      
+      unique_id = f"cve_{cve_id}"
+
+      full_text = (
+         f"CISA KEV Vulnerability\n"
+         f"ID: {cve_id}\n"
+         f"Name: {name}\n"
+         f"Vendor: {vendor}\n"
+         f"Product: {product}\n"
+         f"Description: {description}"
+      )
+
+      documents.append(full_text)
+      ids.append(unique_id)
+      
+      metadatas.append({
+         "external_id": cve_id,
+         "name": name,
+         "tactics": "exploitation",
+         "platforms": product,
+         "source": "CISA KEV"
+      })
+
+   print_status(f"Processed {len(documents)} CISA vulnerabilities.", "success")
    return documents, ids, metadatas
 
 def main():
    clear_screen()
    print_banner()
 
-   # 1. Download
    mitre_data = download_mitre_data()
+   cisa_data = download_cisa_data()
 
-   # 2. Process
-   documents, ids, metadatas = process_data(mitre_data)
+   mitre_docs, mitre_ids, mitre_metas = process_data(mitre_data)
+   cisa_docs, cisa_ids, cisa_metas = process_cisa_data(cisa_data)
 
-   # 3. Load Model
+   documents = mitre_docs + cisa_docs
+   ids = mitre_ids + cisa_ids
+   metadatas = mitre_metas + cisa_metas
+
+   print_status(f"Total Knowledge Base Size: {len(documents)} items.", "info")
+
    print_status(f"Loading Neural Network ({MODEL_NAME})...", "process")
    model = SentenceTransformer(MODEL_NAME)
    print_status("Model loaded in memory.", "success")
 
-   # 4. Initialize DB
    print_status("Initializing Vector Database (ChromaDB)...", "process")
    client = chromadb.PersistentClient(path=DB_PATH)
 
-   # Reset collection
    try:
       client.delete_collection(COLLECTION_NAME)
    except Exception:
@@ -142,10 +200,8 @@ def main():
    )
    print_status(f"Collection '{COLLECTION_NAME}' created.", "success")
 
-   # 5. Ingestion Loop
    print(f"\n{Colors.BOLD}Starting Vector Ingestion...{Colors.ENDC}")
    
-   # Custom progress bar color and format
    for i in tqdm(range(0, len(documents), BATCH_SIZE), 
       desc=f"{Colors.CYAN}Encoding & Storing{Colors.ENDC}", 
       ascii=" #", 
@@ -169,7 +225,7 @@ def main():
       )
 
    print(f"\n{Colors.HEADER}{Colors.BOLD}==========================================")
-   print(f"SYSTEM READY. {len(documents)} Techniques Indexed.")
+   print(f"SYSTEM READY. {len(documents)} Items Indexed (MITRE + CISA).")
    print(f"Database saved at: {DB_PATH}")
    print(f"=========================================={Colors.ENDC}\n")
 
