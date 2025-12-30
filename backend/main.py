@@ -267,6 +267,9 @@ async def chat_endpoint(request: QueryRequest):
          sources=sources[:5] 
       )
 
+   except HTTPException:
+      # Re-raise HTTP exceptions as-is (including security violations)
+      raise
    except Exception as e:
       print(f"[ERROR] {e}")
       raise HTTPException(status_code=500, detail=str(e))

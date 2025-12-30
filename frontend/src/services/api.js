@@ -17,15 +17,19 @@ export const chatService = {
 
          // 4. ENVOI
          // On envoie 'query' ET 'history' au backend
-         const response = await axios.post(`${API_URL}/chat`, { 
+         const response = await axios.post(`${API_URL}/chat`, {
             query: query,
-            history: cleanHistory 
+            history: cleanHistory
          });
-         
+
          return response.data;
       } catch (error) {
          console.error("API Error:", error);
-         throw error;
+         // Extract error detail from API response if available
+         if (error.response && error.response.data && error.response.data.detail) {
+            throw new Error(error.response.data.detail);
+         }
+         throw new Error("Erreur de connexion au serveur.");
       }
    }
 };
