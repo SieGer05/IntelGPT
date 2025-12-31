@@ -378,7 +378,8 @@ class HybridSearchEngine:
         n_results: int = 10,
         where_filter: Optional[Dict] = None,
         search_mode: str = "hybrid",
-        use_reranking: bool = True
+        use_reranking: bool = True,
+        min_score_threshold: float = 0.0
     ) -> Dict[str, Any]:
         """
         Perform hybrid search combining vector and BM25, with optional reranking.
@@ -389,6 +390,7 @@ class HybridSearchEngine:
             where_filter: Optional ChromaDB filter
             search_mode: "hybrid", "vector", or "bm25"
             use_reranking: Whether to apply cross-encoder reranking
+            min_score_threshold: Minimum hybrid/rerank score to include (0.0-1.0)
             
         Returns:
             Dictionary with results and search metadata
@@ -465,6 +467,33 @@ class HybridSearchEngine:
             # No reranking, use combined results
             final_results = combined_results[:n_results]
         
+        # Apply minimum score threshold filtering
+        if min_score_threshold > 0.0:
+            filtered_results = []
+            filtered_rerank_scores = []
+            
+            for i, result in enumerate(final_results):
+                # Use rerank score if available, otherwise use hybrid score
+                score_to_check = rerank_scores[i] if reranked and i < len(rerank_scores) else result.hybrid_score
+                
+                # Normalize rerank scores (cross-encoder outputs can be negative)
+                if reranked and i < len(rerank_scores):
+                    # Sigmoid normalization for cross-encoder scores
+                    import math
+                    normalized_score = 1 / (1 + math.exp(-score_to_check))
+                    score_to_check = normalized_score
+                
+                if score_to_check >= min_score_threshold:
+                    filtered_results.append(result)
+                    if reranked and i < len(rerank_scores):
+                        filtered_rerank_scores.append(rerank_scores[i])
+            
+            final_results = filtered_results
+            if reranked:
+                rerank_scores = filtered_rerank_scores
+            
+            print(f"[THRESHOLD] Filtered from {len(final_results) + (n_results - len(filtered_results))} to {len(final_results)} results (min_score={min_score_threshold})")
+        
         # Format output
         result_dict = {
             "ids": [[r.doc_id for r in final_results]],
@@ -479,7 +508,9 @@ class HybridSearchEngine:
             "search_mode": search_mode,
             "vector_results_count": len(vector_results),
             "bm25_results_count": len(bm25_results),
-            "reranked": reranked
+            "reranked": reranked,
+            "threshold_applied": min_score_threshold > 0.0,
+            "min_score_threshold": min_score_threshold
         }
         
         return result_dict
@@ -507,6 +538,143 @@ class HybridSearchEngine:
                 explanation.append(f"  Rerank Score: {results['scores']['rerank'][i]:.4f}")
         
         return "\n".join(explanation)
+    
+    def multi_query_search(
+        self,
+        queries: List[str],
+        n_results: int = 10,
+        where_filter: Optional[Dict] = None,
+        search_mode: str = "hybrid",
+        use_reranking: bool = True,
+        min_score_threshold: float = 0.0
+    ) -> Dict[str, Any]:
+        """
+        Perform hybrid search with multiple query variants for better recall.
+        Uses Reciprocal Rank Fusion to combine results from all queries.
+        
+        Args:
+            queries: List of query variants (original + expanded)
+            n_results: Number of final results to return
+            where_filter: Optional ChromaDB filter
+            search_mode: "hybrid", "vector", or "bm25"
+            use_reranking: Whether to apply cross-encoder reranking
+            min_score_threshold: Minimum score to include
+            
+        Returns:
+            Dictionary with merged and reranked results
+        """
+        if not queries:
+            return self.search("", n_results, where_filter, search_mode, use_reranking, min_score_threshold)
+        
+        if len(queries) == 1:
+            return self.search(queries[0], n_results, where_filter, search_mode, use_reranking, min_score_threshold)
+        
+        print(f"[MULTI-QUERY SEARCH] Searching with {len(queries)} query variants")
+        
+        # Collect results from all query variants
+        all_results: Dict[str, SearchResult] = {}
+        query_appearances: Dict[str, int] = {}  # Track how many queries found each doc
+        
+        for query in queries:
+            # Get more results per query to have a good pool for fusion
+            results = self.search(
+                query=query,
+                n_results=n_results * 2,
+                where_filter=where_filter,
+                search_mode=search_mode,
+                use_reranking=False,  # Disable reranking per-query, do it at the end
+                min_score_threshold=0.0  # Apply threshold after fusion
+            )
+            
+            for i, doc_id in enumerate(results["ids"][0]):
+                if doc_id not in all_results:
+                    all_results[doc_id] = SearchResult(
+                        doc_id=doc_id,
+                        document=results["documents"][0][i],
+                        metadata=results["metadatas"][0][i],
+                        vector_score=results["scores"]["vector"][i],
+                        bm25_score=results["scores"]["bm25"][i],
+                        hybrid_score=results["scores"]["hybrid"][i]
+                    )
+                    query_appearances[doc_id] = 1
+                else:
+                    # Accumulate scores from multiple queries
+                    existing = all_results[doc_id]
+                    existing.vector_score = max(existing.vector_score, results["scores"]["vector"][i])
+                    existing.bm25_score = max(existing.bm25_score, results["scores"]["bm25"][i])
+                    existing.hybrid_score += results["scores"]["hybrid"][i]  # Sum for RRF
+                    query_appearances[doc_id] += 1
+        
+        # Boost documents found by multiple queries
+        for doc_id, result in all_results.items():
+            appearances = query_appearances[doc_id]
+            if appearances > 1:
+                # Boost hybrid score based on number of query matches
+                result.hybrid_score *= (1 + 0.2 * (appearances - 1))
+        
+        # Sort by combined hybrid score
+        sorted_results = sorted(all_results.values(), key=lambda x: x.hybrid_score, reverse=True)
+        
+        print(f"[MULTI-QUERY SEARCH] Found {len(sorted_results)} unique documents across {len(queries)} queries")
+        
+        # Apply reranking on merged results using the original (first) query
+        reranked = False
+        rerank_scores = []
+        
+        if use_reranking and self.reranker and self.rerank_enabled and sorted_results:
+            docs_for_rerank = [
+                {"id": r.doc_id, "document": r.document, "metadata": r.metadata}
+                for r in sorted_results[:n_results * 2]
+            ]
+            original_scores = [r.hybrid_score for r in sorted_results[:n_results * 2]]
+            
+            rerank_results = self.reranker.rerank(queries[0], docs_for_rerank, original_scores)
+            
+            if rerank_results:
+                reranked = True
+                final_results = []
+                rerank_scores = []
+                
+                for rr in rerank_results[:n_results]:
+                    original = next((r for r in sorted_results if r.doc_id == rr.doc_id), None)
+                    if original:
+                        final_results.append(original)
+                        rerank_scores.append(rr.rerank_score)
+                
+                sorted_results = final_results
+                print(f"[MULTI-QUERY RERANK] Reranked to top {len(sorted_results)} results")
+        
+        # Apply threshold and limit
+        final_results = sorted_results[:n_results]
+        
+        if min_score_threshold > 0.0:
+            if reranked:
+                final_results = [
+                    r for i, r in enumerate(final_results) 
+                    if i < len(rerank_scores) and (1 / (1 + math.exp(-rerank_scores[i]))) >= min_score_threshold
+                ]
+                rerank_scores = rerank_scores[:len(final_results)]
+            else:
+                final_results = [r for r in final_results if r.hybrid_score >= min_score_threshold]
+        
+        return {
+            "ids": [[r.doc_id for r in final_results]],
+            "documents": [[r.document for r in final_results]],
+            "metadatas": [[r.metadata for r in final_results]],
+            "scores": {
+                "hybrid": [r.hybrid_score for r in final_results],
+                "vector": [r.vector_score for r in final_results],
+                "bm25": [r.bm25_score for r in final_results],
+                "rerank": rerank_scores if reranked else [0.0] * len(final_results)
+            },
+            "search_mode": f"multi-query-{search_mode}",
+            "vector_results_count": len([r for r in final_results if r.vector_score > 0]),
+            "bm25_results_count": len([r for r in final_results if r.bm25_score > 0]),
+            "reranked": reranked,
+            "query_count": len(queries),
+            "unique_docs_found": len(all_results),
+            "threshold_applied": min_score_threshold > 0.0
+        }
     
     def get_reranker_stats(self) -> Dict[str, Any]:
         """Get reranker statistics and status."""
