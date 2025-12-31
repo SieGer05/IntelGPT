@@ -92,6 +92,37 @@ const MessageItem = ({ message }) => {
                      <li key={idx}>{src}</li>
                   ))}
                </ul>
+               
+               {/* Display Applied Filters */}
+               {message.appliedFilters && Object.keys(message.appliedFilters).length > 0 && (
+                  <div className="mt-2 pt-2 border-t border-[#424242]">
+                     <span className="font-bold text-gray-500 block mb-1 uppercase tracking-wider text-[10px]">
+                        Filtered by:
+                     </span>
+                     <div className="flex flex-wrap gap-1">
+                        {message.appliedFilters.source && (
+                           <span className="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded text-[10px]">
+                              {message.appliedFilters.source}
+                           </span>
+                        )}
+                        {message.appliedFilters.tactics?.map(t => (
+                           <span key={t} className="px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded text-[10px] capitalize">
+                              {t.replace(/-/g, ' ')}
+                           </span>
+                        ))}
+                        {message.appliedFilters.platforms?.map(p => (
+                           <span key={p} className="px-1.5 py-0.5 bg-emerald-500/20 text-emerald-400 rounded text-[10px]">
+                              {p}
+                           </span>
+                        ))}
+                        {message.appliedFilters.chunk_type && (
+                           <span className="px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded text-[10px] capitalize">
+                              {message.appliedFilters.chunk_type}
+                           </span>
+                        )}
+                     </div>
+                  </div>
+               )}
                </div>
             )}
          </div>

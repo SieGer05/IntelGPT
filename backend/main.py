@@ -171,20 +171,31 @@ class Message(BaseModel):
    role: str
    content: str
 
+class DynamicFilters(BaseModel):
+   """Dynamic filters for search refinement."""
+   tactics: Optional[List[str]] = None  # e.g., ["initial-access", "execution"]
+   platforms: Optional[List[str]] = None  # e.g., ["Windows", "Linux"]
+   source: Optional[str] = None  # "MITRE ATT&CK" or "CISA KEV"
+   chunk_type: Optional[str] = None  # "detection", "mitigation", etc.
+   is_subtechnique: Optional[bool] = None
+
 class QueryRequest(BaseModel):
    query: str
    history: List[Message] = []
    search_mode: str = "hybrid"  # "hybrid", "vector", or "bm25"
+   filters: Optional[DynamicFilters] = None  # Dynamic filtering options
 
 class QueryResponse(BaseModel):
    answer: str
    sources: list[str]
    search_info: Optional[dict] = None  # Optional search debugging info
+   applied_filters: Optional[dict] = None  # Filters that were applied
 
 class SearchRequest(BaseModel):
    query: str
    n_results: int = 5
    search_mode: str = "hybrid"  # "hybrid", "vector", or "bm25"
+   filters: Optional[DynamicFilters] = None  # Dynamic filtering options
 
 class SearchResponse(BaseModel):
    results: List[dict]
@@ -192,6 +203,113 @@ class SearchResponse(BaseModel):
    vector_count: int
    bm25_count: int
    reranked: bool = False
+   applied_filters: Optional[dict] = None
+
+class FilterOptionsResponse(BaseModel):
+   """Available filter options based on indexed data."""
+   tactics: List[str]
+   platforms: List[str]
+   sources: List[str]
+   chunk_types: List[str]
+
+
+def build_chromadb_filter(filters: Optional[DynamicFilters]) -> Optional[dict]:
+   """
+   Build ChromaDB where filter from DynamicFilters.
+   Supports AND logic with multiple conditions.
+   """
+   if not filters:
+      return None
+   
+   conditions = []
+   
+   # Source filter (exact match)
+   if filters.source:
+      conditions.append({"source": filters.source})
+   
+   # Chunk type filter (exact match)
+   if filters.chunk_type:
+      conditions.append({"chunk_type": filters.chunk_type})
+   
+   # Subtechnique filter (boolean)
+   if filters.is_subtechnique is not None:
+      conditions.append({"is_subtechnique": filters.is_subtechnique})
+   
+   # Tactics filter (contains any - stored as comma-separated string)
+   if filters.tactics and len(filters.tactics) > 0:
+      # ChromaDB uses $contains for substring match in string fields
+      # For multiple tactics, we create OR conditions
+      if len(filters.tactics) == 1:
+         conditions.append({"tactics": {"$contains": filters.tactics[0]}})
+      else:
+         tactic_conditions = [{"tactics": {"$contains": t}} for t in filters.tactics]
+         conditions.append({"$or": tactic_conditions})
+   
+   # Platforms filter (contains any - stored as comma-separated string)
+   if filters.platforms and len(filters.platforms) > 0:
+      if len(filters.platforms) == 1:
+         conditions.append({"platforms": {"$contains": filters.platforms[0]}})
+      else:
+         platform_conditions = [{"platforms": {"$contains": p}} for p in filters.platforms]
+         conditions.append({"$or": platform_conditions})
+   
+   # Combine with AND logic
+   if len(conditions) == 0:
+      return None
+   elif len(conditions) == 1:
+      return conditions[0]
+   else:
+      return {"$and": conditions}
+
+
+# FILTER OPTIONS ENDPOINT
+@app.get("/api/filters", response_model=FilterOptionsResponse)
+async def get_filter_options():
+   """
+   Returns all available filter options based on indexed data.
+   This allows the frontend to dynamically populate filter dropdowns.
+   """
+   try:
+      # Fetch all documents metadata
+      all_docs = collection.get(include=["metadatas"])
+      
+      tactics_set = set()
+      platforms_set = set()
+      sources_set = set()
+      chunk_types_set = set()
+      
+      for meta in all_docs.get("metadatas", []):
+         # Parse tactics (comma-separated)
+         if meta.get("tactics") and meta["tactics"] != "N/A":
+            for tactic in meta["tactics"].split(", "):
+               if tactic.strip():
+                  tactics_set.add(tactic.strip())
+         
+         # Parse platforms (comma-separated)
+         if meta.get("platforms") and meta["platforms"] != "N/A":
+            for platform in meta["platforms"].split(", "):
+               if platform.strip():
+                  platforms_set.add(platform.strip())
+         
+         # Source
+         if meta.get("source"):
+            sources_set.add(meta["source"])
+         
+         # Chunk type
+         if meta.get("chunk_type"):
+            chunk_types_set.add(meta["chunk_type"])
+      
+      return FilterOptionsResponse(
+         tactics=sorted(list(tactics_set)),
+         platforms=sorted(list(platforms_set)),
+         sources=sorted(list(sources_set)),
+         chunk_types=sorted(list(chunk_types_set))
+      )
+   
+   except Exception as e:
+      logger.error(f"Failed to get filter options: {e}")
+      raise HTTPException(status_code=500, detail=str(e))
+
 
 # SEARCH ENDPOINT (for testing/debugging hybrid search)
 @app.post("/search", response_model=SearchResponse)
@@ -199,12 +317,22 @@ async def search_endpoint(request: SearchRequest):
    """
    Direct search endpoint to test hybrid search.
    Returns raw search results with scoring details.
+   Supports dynamic filtering by tactics, platforms, source, chunk_type.
    """
    try:
+      # Build where filter from request filters
+      where_filter = build_chromadb_filter(request.filters)
+      applied_filters = None
+      
+      if where_filter:
+         print(f"[SEARCH] Applying dynamic filters: {request.filters}")
+         applied_filters = request.filters.model_dump(exclude_none=True) if request.filters else None
+      
       results = hybrid_search_engine.search(
          query=request.query,
          n_results=request.n_results,
-         search_mode=request.search_mode
+         search_mode=request.search_mode,
+         where_filter=where_filter
       )
       
       formatted_results = []
@@ -214,6 +342,10 @@ async def search_endpoint(request: SearchRequest):
             "id": doc_id,
             "name": results["metadatas"][0][i].get("name", "Unknown"),
             "external_id": results["metadatas"][0][i].get("external_id", "N/A"),
+            "tactics": results["metadatas"][0][i].get("tactics", "N/A"),
+            "platforms": results["metadatas"][0][i].get("platforms", "N/A"),
+            "source": results["metadatas"][0][i].get("source", "N/A"),
+            "chunk_type": results["metadatas"][0][i].get("chunk_type", "N/A"),
             "hybrid_score": round(results["scores"]["hybrid"][i], 4),
             "vector_score": round(results["scores"]["vector"][i], 4),
             "bm25_score": round(results["scores"]["bm25"][i], 4),
@@ -226,7 +358,8 @@ async def search_endpoint(request: SearchRequest):
          search_mode=results["search_mode"],
          vector_count=results["vector_results_count"],
          bm25_count=results["bm25_results_count"],
-         reranked=results.get("reranked", False)
+         reranked=results.get("reranked", False),
+         applied_filters=applied_filters
       )
    except Exception as e:
       logger.error(f"Search error: {e}")
@@ -292,6 +425,7 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
       context_text = ""
       sources = []
       system_prompt = ""
+      applied_filters = None  # Initialize for both paths
 
       # Step 2: Branching
       if intent == "technical":
@@ -336,17 +470,33 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
          cve_match = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
          mitre_match = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
          
-         where_filter = None
+         # Start with dynamic filters from request
+         where_filter = build_chromadb_filter(request.filters)
+         applied_filters = request.filters.model_dump(exclude_none=True) if request.filters else None
          
          if cve_match:
             target_id = cve_match.group(1).upper()
             print(f"[SMART SEARCH] Exact CVE detected: {target_id}")
-            where_filter = {"external_id": target_id}
+            # Merge with existing filters using $and
+            id_filter = {"external_id": target_id}
+            if where_filter:
+               where_filter = {"$and": [where_filter, id_filter]}
+            else:
+               where_filter = id_filter
              
          elif mitre_match:
             target_id = mitre_match.group(1).upper()
             print(f"[SMART SEARCH] Exact MITRE ID detected: {target_id}")
-            where_filter = {"external_id": target_id}
+            # Merge with existing filters using $and
+            id_filter = {"external_id": target_id}
+            if where_filter:
+               where_filter = {"$and": [where_filter, id_filter]}
+            else:
+               where_filter = id_filter
+         
+         # Log applied filters
+         if applied_filters:
+            print(f"[DYNAMIC FILTERS] Applying user filters: {applied_filters}")
 
          # --- HYBRID SEARCH (Vector + BM25) ---
          results = {'documents': [], 'metadatas': []}
@@ -440,7 +590,8 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
 
       return QueryResponse(
          answer=response_text,
-         sources=sources[:5] 
+         sources=sources[:5],
+         applied_filters=applied_filters if intent == "technical" else None
       )
 
    except HTTPException:
