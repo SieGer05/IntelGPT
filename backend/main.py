@@ -140,15 +140,25 @@ async def startup_event():
    collection = chroma_client.get_collection(COLLECTION_NAME)
    groq_client = Groq(api_key=API_KEY)
    
-   # Initialize Hybrid Search Engine (Vector + BM25)
+   # Initialize Hybrid Search Engine (Vector + BM25 + Reranking)
    hybrid_search_engine = HybridSearchEngine(
       collection=collection,
       embedding_model=embedding_model,
       vector_weight=0.5,  # Balanced weights
-      bm25_weight=0.5
+      bm25_weight=0.5,
+      rerank_enabled=True,  # Enable cross-encoder reranking
+      rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",  # Fast & accurate model
+      rerank_top_k=10  # Return top 10 after reranking
    )
    doc_count = hybrid_search_engine.build_bm25_index()
    logger.info(f"Hybrid Search Engine initialized with {doc_count} documents")
+   
+   # Log reranker status
+   reranker_stats = hybrid_search_engine.get_reranker_stats()
+   if reranker_stats.get("is_loaded"):
+      logger.info(f"Cross-Encoder Reranker loaded: {reranker_stats.get('model_name')}")
+   else:
+      logger.warning("Cross-Encoder Reranker not loaded - will load on first search")
    
    # Initialize Security Guards
    input_guard = InputGuard(log_events=True)
@@ -181,6 +191,7 @@ class SearchResponse(BaseModel):
    search_mode: str
    vector_count: int
    bm25_count: int
+   reranked: bool = False
 
 # SEARCH ENDPOINT (for testing/debugging hybrid search)
 @app.post("/search", response_model=SearchResponse)
@@ -206,6 +217,7 @@ async def search_endpoint(request: SearchRequest):
             "hybrid_score": round(results["scores"]["hybrid"][i], 4),
             "vector_score": round(results["scores"]["vector"][i], 4),
             "bm25_score": round(results["scores"]["bm25"][i], 4),
+            "rerank_score": round(results["scores"]["rerank"][i], 4) if results.get("reranked") else None,
             "excerpt": results["documents"][0][i][:200] + "..."
          })
       
@@ -213,7 +225,8 @@ async def search_endpoint(request: SearchRequest):
          results=formatted_results,
          search_mode=results["search_mode"],
          vector_count=results["vector_results_count"],
-         bm25_count=results["bm25_results_count"]
+         bm25_count=results["bm25_results_count"],
+         reranked=results.get("reranked", False)
       )
    except Exception as e:
       logger.error(f"Search error: {e}")
