@@ -1,3 +1,4 @@
+# Core dependencies
 groq
 tqdm
 uvicorn
@@ -6,4 +7,7 @@ pydantic
 requests
 chromadb
 python-dotenv
+
+# ML/Embeddings - includes both SentenceTransformer (bi-encoder) 
+# and CrossEncoder (reranker) support
 sentence-transformers

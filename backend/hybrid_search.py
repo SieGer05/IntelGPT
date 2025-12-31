@@ -7,6 +7,10 @@ for improved retrieval accuracy. This approach leverages:
 - BM25 Search: Matches exact keywords and terms (great for IDs, technical terms)
 
 The final ranking uses Reciprocal Rank Fusion (RRF) to combine both results.
+
+Post-Retrieval Reranking:
+- Uses Cross-Encoder models for more accurate relevance scoring
+- Reorders top candidates based on query-document semantic similarity
 """
 
 import math
@@ -14,6 +18,9 @@ import re
 from collections import defaultdict
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
+
+# Import reranker module
+from reranker import CrossEncoderReranker, RerankResult
 
 
 @dataclass
@@ -187,6 +194,8 @@ class HybridSearchEngine:
     RRF_score = sum(1 / (k + rank_i)) for each ranking method
     
     This approach is robust and doesn't require score normalization.
+    
+    Includes optional Cross-Encoder reranking for improved accuracy.
     """
     
     def __init__(
@@ -195,7 +204,10 @@ class HybridSearchEngine:
         embedding_model,  # SentenceTransformer model
         vector_weight: float = 0.5,
         bm25_weight: float = 0.5,
-        rrf_k: int = 60
+        rrf_k: int = 60,
+        rerank_enabled: bool = True,
+        rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        rerank_top_k: int = 5
     ):
         """
         Initialize Hybrid Search Engine.
@@ -206,6 +218,9 @@ class HybridSearchEngine:
             vector_weight: Weight for vector search results (0-1)
             bm25_weight: Weight for BM25 results (0-1)
             rrf_k: RRF constant (higher = more emphasis on top ranks)
+            rerank_enabled: Whether to enable cross-encoder reranking
+            rerank_model: HuggingFace model name for cross-encoder
+            rerank_top_k: Number of documents to return after reranking
         """
         self.collection = collection
         self.embedding_model = embedding_model
@@ -216,6 +231,16 @@ class HybridSearchEngine:
         # Initialize BM25 index
         self.bm25_index = BM25Index()
         self._index_built = False
+        
+        # Initialize Reranker
+        self.rerank_enabled = rerank_enabled
+        self.reranker = None
+        if rerank_enabled:
+            self.reranker = CrossEncoderReranker(
+                model_name=rerank_model,
+                top_k=rerank_top_k,
+                enabled=True
+            )
     
     def build_bm25_index(self) -> int:
         """
@@ -241,6 +266,11 @@ class HybridSearchEngine:
         self.bm25_index.build_index(documents)
         self._index_built = True
         print(f"[HYBRID] BM25 index built with {len(documents)} documents")
+        
+        # Load reranker model if enabled
+        if self.reranker and self.rerank_enabled:
+            self.reranker.load_model()
+        
         return len(documents)
     
     def _vector_search(self, query: str, n_results: int, where_filter: Optional[Dict] = None) -> List[SearchResult]:
@@ -347,22 +377,25 @@ class HybridSearchEngine:
         query: str,
         n_results: int = 10,
         where_filter: Optional[Dict] = None,
-        search_mode: str = "hybrid"
+        search_mode: str = "hybrid",
+        use_reranking: bool = True
     ) -> Dict[str, Any]:
         """
-        Perform hybrid search combining vector and BM25.
+        Perform hybrid search combining vector and BM25, with optional reranking.
         
         Args:
             query: Search query
             n_results: Number of results to return
             where_filter: Optional ChromaDB filter
             search_mode: "hybrid", "vector", or "bm25"
+            use_reranking: Whether to apply cross-encoder reranking
             
         Returns:
             Dictionary with results and search metadata
         """
-        # Expand search pool for better fusion
-        pool_size = n_results * 2
+        # Expand search pool for better fusion and reranking
+        # Reranking works best with more candidates
+        pool_size = n_results * 3 if (use_reranking and self.reranker) else n_results * 2
         
         vector_results = []
         bm25_results = []
@@ -383,32 +416,86 @@ class HybridSearchEngine:
         else:
             combined_results = []
         
-        # Trim to requested size
-        final_results = combined_results[:n_results]
+        # Apply reranking if enabled
+        reranked = False
+        rerank_scores = []
+        
+        if use_reranking and self.reranker and self.rerank_enabled and combined_results:
+            # Prepare documents for reranking
+            docs_for_rerank = [
+                {
+                    "id": r.doc_id,
+                    "document": r.document,
+                    "metadata": r.metadata
+                }
+                for r in combined_results[:pool_size]
+            ]
+            original_scores = [r.hybrid_score for r in combined_results[:pool_size]]
+            
+            # Perform reranking
+            rerank_results = self.reranker.rerank(query, docs_for_rerank, original_scores)
+            
+            if rerank_results:
+                reranked = True
+                # Rebuild final results from rerank output
+                final_results = []
+                rerank_scores = []
+                
+                for rr in rerank_results[:n_results]:
+                    # Find original result to preserve all scores
+                    original = next((r for r in combined_results if r.doc_id == rr.doc_id), None)
+                    if original:
+                        final_results.append(original)
+                        rerank_scores.append(rr.rerank_score)
+                    else:
+                        # Fallback: create new SearchResult
+                        final_results.append(SearchResult(
+                            doc_id=rr.doc_id,
+                            document=rr.document,
+                            metadata=rr.metadata,
+                            hybrid_score=rr.original_score
+                        ))
+                        rerank_scores.append(rr.rerank_score)
+                
+                print(f"[RERANK] Applied cross-encoder reranking: {len(rerank_results)} documents scored")
+            else:
+                # Reranking failed, use original results
+                final_results = combined_results[:n_results]
+        else:
+            # No reranking, use combined results
+            final_results = combined_results[:n_results]
         
         # Format output
-        return {
+        result_dict = {
             "ids": [[r.doc_id for r in final_results]],
             "documents": [[r.document for r in final_results]],
             "metadatas": [[r.metadata for r in final_results]],
             "scores": {
                 "hybrid": [r.hybrid_score for r in final_results],
                 "vector": [r.vector_score for r in final_results],
-                "bm25": [r.bm25_score for r in final_results]
+                "bm25": [r.bm25_score for r in final_results],
+                "rerank": rerank_scores if reranked else [0.0] * len(final_results)
             },
             "search_mode": search_mode,
             "vector_results_count": len(vector_results),
-            "bm25_results_count": len(bm25_results)
+            "bm25_results_count": len(bm25_results),
+            "reranked": reranked
         }
+        
+        return result_dict
     
     def explain_search(self, query: str, n_results: int = 5) -> str:
         """
         Perform search and return explanation of ranking.
         Useful for debugging and understanding search behavior.
         """
-        results = self.search(query, n_results, search_mode="hybrid")
+        results = self.search(query, n_results, search_mode="hybrid", use_reranking=True)
         
-        explanation = [f"Query: '{query}'", "=" * 50]
+        explanation = [
+            f"Query: '{query}'",
+            f"Reranking: {'Enabled' if results.get('reranked') else 'Disabled'}",
+            "=" * 60
+        ]
         
         for i, doc_id in enumerate(results["ids"][0]):
             meta = results["metadatas"][0][i]
@@ -416,5 +503,13 @@ class HybridSearchEngine:
             explanation.append(f"  Hybrid Score: {results['scores']['hybrid'][i]:.4f}")
             explanation.append(f"  Vector Score: {results['scores']['vector'][i]:.4f}")
             explanation.append(f"  BM25 Score:   {results['scores']['bm25'][i]:.4f}")
+            if results.get('reranked') and results['scores']['rerank']:
+                explanation.append(f"  Rerank Score: {results['scores']['rerank'][i]:.4f}")
         
         return "\n".join(explanation)
+    
+    def get_reranker_stats(self) -> Dict[str, Any]:
+        """Get reranker statistics and status."""
+        if self.reranker:
+            return self.reranker.get_stats()
+        return {"enabled": False, "is_loaded": False}
