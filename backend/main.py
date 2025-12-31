@@ -10,6 +10,9 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 from dotenv import load_dotenv
 
+# Security Layer
+from security import InputGuard, OutputGuard, SecurityException
+
 # CONFIGURATION
 # Load environment variables
 load_dotenv()
@@ -37,10 +40,12 @@ embedding_model = None
 chroma_client = None
 collection = None
 groq_client = None
+input_guard = None
+output_guard = None
 
 @app.on_event("startup")
 async def startup_event():
-   global embedding_model, chroma_client, collection, groq_client
+   global embedding_model, chroma_client, collection, groq_client, input_guard, output_guard
    
    print("[INIT] Loading Models & Database...")
    if not API_KEY:
@@ -50,6 +55,11 @@ async def startup_event():
    chroma_client = chromadb.PersistentClient(path=DB_PATH)
    collection = chroma_client.get_collection(COLLECTION_NAME)
    groq_client = Groq(api_key=API_KEY)
+   
+   # Initialize Security Guards
+   input_guard = InputGuard(log_events=True)
+   output_guard = OutputGuard(log_events=True)
+   print("[SECURITY] Input & Output Guards initialized.")
    print("[READY] API is ready to accept requests.")
 
 # DATA MODELS 
@@ -74,6 +84,16 @@ async def chat_endpoint(request: QueryRequest):
 
       if not user_query:
          raise HTTPException(status_code=400, detail="Query cannot be empty")
+      
+      # Security Layer: Input Validation
+      try:
+         input_guard.validate(user_query)
+      except SecurityException as e:
+         print(f"[SECURITY BLOCKED] {e}")
+         raise HTTPException(
+            status_code=400, 
+            detail=f"Security violation: {e.message}"
+         )
       
       # Step 1: ROUTER (THE BRAIN) 
       print(f"[ROUTER] Analyzing intent for: {user_query}")
@@ -235,12 +255,21 @@ async def chat_endpoint(request: QueryRequest):
       )
 
       response_text = chat_completion.choices[0].message.content
+      
+      # Security Layer: Output Sanitization
+      sanitization_result = output_guard.sanitize_detailed(response_text)
+      if sanitization_result.redactions_made > 0:
+         print(f"[OUTPUT GUARD] Redacted {sanitization_result.redactions_made} sensitive items")
+      response_text = sanitization_result.sanitized_text
 
       return QueryResponse(
          answer=response_text,
          sources=sources[:5] 
       )
 
+   except HTTPException:
+      # Re-raise HTTP exceptions as-is (including security violations)
+      raise
    except Exception as e:
       print(f"[ERROR] {e}")
       raise HTTPException(status_code=500, detail=str(e))
