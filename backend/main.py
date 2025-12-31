@@ -463,6 +463,46 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
             print(f"[REWRITE] Original: '{user_query}' -> New: '{search_query}'")
          # --- ENHANCEMENT END ---
 
+         # --- MULTI-QUERY EXPANSION START ---
+         # Generate semantic variants of the query for better coverage
+         query_variants = [search_query]  # Always include original
+         
+         # Only expand if query is conceptual (not an ID lookup)
+         cve_check = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
+         mitre_check = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
+         
+         if not cve_check and not mitre_check:
+            print("[MULTI-QUERY] Generating query variants for better coverage...")
+            
+            expansion_prompt = f"""
+            Generate 2 alternative search queries for the following cybersecurity question.
+            Each variant should use different terminology or phrasing while preserving the original meaning.
+            
+            Original query: "{search_query}"
+            
+            Rules:
+            - Use synonyms and related technical terms
+            - Keep queries concise (under 15 words)
+            - Focus on different aspects of the same concept
+            - Output ONLY the 2 queries, one per line, no numbering or bullets
+            """
+            
+            try:
+               expansion_completion = groq_client.chat.completions.create(
+                  messages=[{"role": "user", "content": expansion_prompt}],
+                  model=GROQ_MODEL,
+                  temperature=0.7,
+                  max_tokens=150
+               )
+               
+               expanded = expansion_completion.choices[0].message.content.strip()
+               new_variants = [v.strip() for v in expanded.split('\n') if v.strip()][:2]
+               query_variants.extend(new_variants)
+               print(f"[MULTI-QUERY] Variants: {query_variants}")
+            except Exception as e:
+               print(f"[MULTI-QUERY] Expansion failed, using original query only: {e}")
+         # --- MULTI-QUERY EXPANSION END ---
+
          print(f"[PATH] Technical Query -> Searching Database for: {search_query}")
 
          # --- SMART RETRIEVAL LOGIC START ---
@@ -498,38 +538,43 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
          if applied_filters:
             print(f"[DYNAMIC FILTERS] Applying user filters: {applied_filters}")
 
-         # --- HYBRID SEARCH (Vector + BM25) ---
+         # --- HYBRID SEARCH (Vector + BM25) WITH MULTI-QUERY ---
          results = {'documents': [], 'metadatas': []}
 
          # Execute Hybrid Search
          if where_filter:
-            # Case 1: Smart Filter Active (exact ID match)
+            # Case 1: Smart Filter Active (exact ID match) - use single query
             print(f"[HYBRID SEARCH] Using filter mode for exact ID match")
             results = hybrid_search_engine.search(
                query=search_query,
                n_results=5,
                where_filter=where_filter,
-               search_mode="hybrid"
+               search_mode="hybrid",
+               min_score_threshold=0.1  # Apply threshold
             )
             # Fallback if filter returns nothing
             if not results['documents'] or not results['documents'][0]:
                print("[HYBRID SEARCH] ID not found, falling back to full hybrid search...")
-               results = hybrid_search_engine.search(
-                  query=search_query,
+               results = hybrid_search_engine.multi_query_search(
+                  queries=query_variants,
                   n_results=10,
-                  search_mode="hybrid"
+                  search_mode="hybrid",
+                  min_score_threshold=0.05
                )
          else:
-            # Case 2: Full Hybrid Search (Vector + BM25)
-            print(f"[HYBRID SEARCH] Combining Vector + BM25 search")
-            results = hybrid_search_engine.search(
-               query=search_query,
+            # Case 2: Full Multi-Query Hybrid Search (Vector + BM25)
+            print(f"[HYBRID SEARCH] Combining Vector + BM25 with {len(query_variants)} query variants")
+            results = hybrid_search_engine.multi_query_search(
+               queries=query_variants,
                n_results=10,
-               search_mode="hybrid"
+               search_mode="hybrid",
+               min_score_threshold=0.05  # Filter low-quality results
             )
          
          # Log search performance
-         print(f"[HYBRID SEARCH] Vector results: {results.get('vector_results_count', 0)}, BM25 results: {results.get('bm25_results_count', 0)}")
+         print(f"[HYBRID SEARCH] Vector results: {results.get('vector_results_count', 0)}, BM25 results: {results.get('bm25_results_count', 0)}, Reranked: {results.get('reranked', False)}")
+         if results.get('query_count'):
+            print(f"[MULTI-QUERY] Used {results.get('query_count')} queries, found {results.get('unique_docs_found', 0)} unique docs")
          # --- END HYBRID SEARCH ---
 
          if results['documents'] and results['documents'][0]:
