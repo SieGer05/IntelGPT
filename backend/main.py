@@ -4,7 +4,7 @@ import re
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List 
+from typing import List, Optional
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
@@ -13,7 +13,10 @@ from dotenv import load_dotenv
 # Security Layer
 from security import InputGuard, OutputGuard, SecurityException
 from structured_logger import logger
-import json
+
+# Hybrid Search (Vector + BM25)
+from hybrid_search import HybridSearchEngine
+
 import time
 
 # CONFIGURATION
@@ -122,10 +125,11 @@ collection = None
 groq_client = None
 input_guard = None
 output_guard = None
+hybrid_search_engine = None  # Hybrid Search (Vector + BM25)
 
 @app.on_event("startup")
 async def startup_event():
-   global embedding_model, chroma_client, collection, groq_client, input_guard, output_guard
+   global embedding_model, chroma_client, collection, groq_client, input_guard, output_guard, hybrid_search_engine
    
    logger.info("Loading Models & Database...")
    if not API_KEY:
@@ -135,6 +139,16 @@ async def startup_event():
    chroma_client = chromadb.PersistentClient(path=DB_PATH)
    collection = chroma_client.get_collection(COLLECTION_NAME)
    groq_client = Groq(api_key=API_KEY)
+   
+   # Initialize Hybrid Search Engine (Vector + BM25)
+   hybrid_search_engine = HybridSearchEngine(
+      collection=collection,
+      embedding_model=embedding_model,
+      vector_weight=0.5,  # Balanced weights
+      bm25_weight=0.5
+   )
+   doc_count = hybrid_search_engine.build_bm25_index()
+   logger.info(f"Hybrid Search Engine initialized with {doc_count} documents")
    
    # Initialize Security Guards
    input_guard = InputGuard(log_events=True)
@@ -150,12 +164,62 @@ class Message(BaseModel):
 class QueryRequest(BaseModel):
    query: str
    history: List[Message] = []
+   search_mode: str = "hybrid"  # "hybrid", "vector", or "bm25"
 
 class QueryResponse(BaseModel):
    answer: str
    sources: list[str]
+   search_info: Optional[dict] = None  # Optional search debugging info
 
-# ENDPOINT
+class SearchRequest(BaseModel):
+   query: str
+   n_results: int = 5
+   search_mode: str = "hybrid"  # "hybrid", "vector", or "bm25"
+
+class SearchResponse(BaseModel):
+   results: List[dict]
+   search_mode: str
+   vector_count: int
+   bm25_count: int
+
+# SEARCH ENDPOINT (for testing/debugging hybrid search)
+@app.post("/search", response_model=SearchResponse)
+async def search_endpoint(request: SearchRequest):
+   """
+   Direct search endpoint to test hybrid search.
+   Returns raw search results with scoring details.
+   """
+   try:
+      results = hybrid_search_engine.search(
+         query=request.query,
+         n_results=request.n_results,
+         search_mode=request.search_mode
+      )
+      
+      formatted_results = []
+      for i, doc_id in enumerate(results["ids"][0]):
+         formatted_results.append({
+            "rank": i + 1,
+            "id": doc_id,
+            "name": results["metadatas"][0][i].get("name", "Unknown"),
+            "external_id": results["metadatas"][0][i].get("external_id", "N/A"),
+            "hybrid_score": round(results["scores"]["hybrid"][i], 4),
+            "vector_score": round(results["scores"]["vector"][i], 4),
+            "bm25_score": round(results["scores"]["bm25"][i], 4),
+            "excerpt": results["documents"][0][i][:200] + "..."
+         })
+      
+      return SearchResponse(
+         results=formatted_results,
+         search_mode=results["search_mode"],
+         vector_count=results["vector_results_count"],
+         bm25_count=results["bm25_results_count"]
+      )
+   except Exception as e:
+      logger.error(f"Search error: {e}")
+      raise HTTPException(status_code=500, detail=str(e))
+
+# CHAT ENDPOINT
 @app.post("/chat", response_model=QueryResponse)
 async def chat_endpoint(request: QueryRequest, raw_request: Request):
    try:
@@ -271,26 +335,39 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
             print(f"[SMART SEARCH] Exact MITRE ID detected: {target_id}")
             where_filter = {"external_id": target_id}
 
-         # Prepare Vector Search
-         query_vector = embedding_model.encode([search_query]).tolist()
+         # --- HYBRID SEARCH (Vector + BM25) ---
          results = {'documents': [], 'metadatas': []}
 
-         # Execute Query
+         # Execute Hybrid Search
          if where_filter:
-            # Case 1: Smart Filter Active
-            results = collection.query(
-               query_embeddings=query_vector, 
-               n_results=5, 
-               where=where_filter
+            # Case 1: Smart Filter Active (exact ID match)
+            print(f"[HYBRID SEARCH] Using filter mode for exact ID match")
+            results = hybrid_search_engine.search(
+               query=search_query,
+               n_results=5,
+               where_filter=where_filter,
+               search_mode="hybrid"
             )
-            # Fallback if filter returns nothing (e.g. typo in ID or ID not in DB)
+            # Fallback if filter returns nothing
             if not results['documents'] or not results['documents'][0]:
-               print("[SMART SEARCH] ID not found in DB, falling back to semantic search...")
-               results = collection.query(query_embeddings=query_vector, n_results=10)
+               print("[HYBRID SEARCH] ID not found, falling back to full hybrid search...")
+               results = hybrid_search_engine.search(
+                  query=search_query,
+                  n_results=10,
+                  search_mode="hybrid"
+               )
          else:
-            # Case 2: Standard Semantic Search (Broad search)
-            results = collection.query(query_embeddings=query_vector, n_results=10)
-         # --- SMART RETRIEVAL LOGIC END ---
+            # Case 2: Full Hybrid Search (Vector + BM25)
+            print(f"[HYBRID SEARCH] Combining Vector + BM25 search")
+            results = hybrid_search_engine.search(
+               query=search_query,
+               n_results=10,
+               search_mode="hybrid"
+            )
+         
+         # Log search performance
+         print(f"[HYBRID SEARCH] Vector results: {results.get('vector_results_count', 0)}, BM25 results: {results.get('bm25_results_count', 0)}")
+         # --- END HYBRID SEARCH ---
 
          if results['documents'] and results['documents'][0]:
             for i in range(len(results['documents'][0])):
