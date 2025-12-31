@@ -1,4 +1,5 @@
-import { Plus, MessageSquare, PanelLeftClose } from 'lucide-react';
+import { Plus, MessageSquare, PanelLeftClose, FileText } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import logo from '../../assets/logo.png'; 
 
 const Sidebar = ({ onReset, isOpen, toggleSidebar }) => {
@@ -33,6 +34,12 @@ const Sidebar = ({ onReset, isOpen, toggleSidebar }) => {
             <div className="flex items-center gap-3 px-3 py-3 text-sm text-gray-300 hover:bg-[#303131] rounded cursor-pointer transition-colors">
                <MessageSquare size={16} /> Session active
             </div>
+
+         <div className="mt-auto border-t border-[#303131] pt-2 pb-2">
+            <Link to="/logs" className="flex items-center gap-3 px-3 py-3 text-sm text-gray-300 hover:bg-[#303131] rounded cursor-pointer transition-colors">
+               <FileText size={16} /> Logs System
+            </Link>
+         </div>
          </div>
       </aside>
    );
