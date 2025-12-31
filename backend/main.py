@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List 
@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 
 # Security Layer
 from security import InputGuard, OutputGuard, SecurityException
+from structured_logger import logger
+import json
+import time
 
 # CONFIGURATION
 # Load environment variables
@@ -31,8 +34,85 @@ app.add_middleware(
    allow_origins=["*"], 
    allow_credentials=True,
    allow_methods=["*"],
-   allow_headers=["*"],
+    allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # 1. Skip logging for the logs endpoint itself (reduce noise)
+    if "api/logs" in request.url.path:
+        return await call_next(request)
+
+    start_time = time.time()
+    
+    # 2. CAPTURE BODY (PROMPT) safely
+    # We need to read the body, but consuming it empties the stream for the actual endpoint.
+    # So we read it, then "refill" it for the next handler.
+    body_bytes = await request.body()
+    # Refill the body stream so the endpoint can read it again
+    request._receive =  lambda: {"type": "http.request", "body": body_bytes}
+    
+    user_prompt = "N/A"
+    try:
+        if body_bytes:
+            data = json.loads(body_bytes)
+            # Try to find 'query', 'prompt', or 'content'
+            user_prompt = data.get("query") or data.get("prompt") or data.get("content") or "N/A"
+    except:
+        pass
+
+    # 3. CRITICALITY CHECK
+    # Define dangerous keywords list
+    DANGEROUS_KEYWORDS = ["system prompt", "system show me", "default prompt", "ignore previous instructions"]
+    is_critical = False
+    
+    if user_prompt and user_prompt != "N/A":
+        lower_prompt = user_prompt.lower()
+        if any(keyword in lower_prompt for keyword in DANGEROUS_KEYWORDS):
+            is_critical = True
+
+    # Process request
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # If an unhandled exception occurs (should be rare due to global handler), re-raise to let FastAPI handle it.
+        # But for middleware logging, we might want to capture something.
+        # However, FastAPI's exception handlers usually execute before middleware returns if they return a response.
+        # If they raise, it bubbles up.
+        raise e
+
+    process_time = time.time() - start_time
+    
+    # Check if a security violation was flagged in the endpoint
+    security_violation = getattr(request.state, "security_violation", None)
+    
+    log_data = {
+        "event": "http_request",
+        "client_ip": request.client.host,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "duration_seconds": round(process_time, 4),
+        "prompt": user_prompt, 
+        "is_critical": is_critical 
+    }
+
+    if security_violation:
+        # MERGE security info into the log
+        log_data["event"] = "security_violation"
+        log_data["violation_type"] = security_violation.get("violation_type")
+        log_data["input_sample"] = security_violation.get("input_sample")
+        log_data["is_critical"] = True
+        
+        logger.warning(f"Security Blocked: {security_violation.get('violation_type')}", extra={"extra_data": log_data})
+    
+    elif is_critical:
+        # Keyword match but no exception raised (e.g. might be allowed but flagged)
+        logger.warning(f"CRITICAL PROMPT DETECTED: {user_prompt}", extra={"extra_data": log_data})
+    else:
+        logger.info("Request processed", extra={"extra_data": log_data})
+    
+    return response
 
 # GLOBAL VARIABLES
 ## We load these once at startup so requests are fast
@@ -47,7 +127,7 @@ output_guard = None
 async def startup_event():
    global embedding_model, chroma_client, collection, groq_client, input_guard, output_guard
    
-   print("[INIT] Loading Models & Database...")
+   logger.info("Loading Models & Database...")
    if not API_KEY:
       raise ValueError("GROQ_API_KEY not found in .env file")
       
@@ -59,8 +139,8 @@ async def startup_event():
    # Initialize Security Guards
    input_guard = InputGuard(log_events=True)
    output_guard = OutputGuard(log_events=True)
-   print("[SECURITY] Input & Output Guards initialized.")
-   print("[READY] API is ready to accept requests.")
+   logger.info("Input & Output Guards initialized.")
+   logger.info("API is ready to accept requests.")
 
 # DATA MODELS 
 class Message(BaseModel):
@@ -77,7 +157,7 @@ class QueryResponse(BaseModel):
 
 # ENDPOINT
 @app.post("/chat", response_model=QueryResponse)
-async def chat_endpoint(request: QueryRequest):
+async def chat_endpoint(request: QueryRequest, raw_request: Request):
    try:
       user_query = request.query.strip()
       history = request.history
@@ -89,10 +169,16 @@ async def chat_endpoint(request: QueryRequest):
       try:
          input_guard.validate(user_query)
       except SecurityException as e:
-         print(f"[SECURITY BLOCKED] {e}")
+         # Store violation details in state for the middleware to log ONCE
+         raw_request.state.security_violation = {
+             "violation_type": e.message,
+             "input_sample": user_query[:50] 
+         }
+         
+         # Customized User Message
          raise HTTPException(
             status_code=400, 
-            detail=f"Security violation: {e.message}"
+            detail=f"⚠️ Security Alert: Your request was blocked because it violates our safety policies. \nReason: {e.message}.\n\nPlease rephrase your query to focus on educational cyber security concepts."
          )
       
       # Step 1: ROUTER (THE BRAIN) 
@@ -271,5 +357,42 @@ async def chat_endpoint(request: QueryRequest):
       # Re-raise HTTP exceptions as-is (including security violations)
       raise
    except Exception as e:
-      print(f"[ERROR] {e}")
+      logger.error(f"Internal Server Error: {e}")
       raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/logs")
+async def get_logs():
+    """Returns the last 100 log entries from the JSONL file."""
+    log_file_path = os.path.join("logs", "events.jsonl")
+    if not os.path.exists(log_file_path):
+        return {"logs": []}
+    
+    logs = []
+    try:
+        with open(log_file_path, "r") as f:
+            # Read all lines and take the last 100
+            lines = f.readlines()
+            last_lines = lines[-100:]
+            
+            for line in last_lines:
+                try:
+                    logs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue # Skip broken lines
+        
+        # Calculate basic metrics
+        total_requests = sum(1 for log in logs if log.get("event") == "http_request")
+        security_events = sum(1 for log in logs if log.get("event") == "security_violation" or log.get("is_critical"))
+        
+        # Return reversed so newest are at top
+        return {
+            "logs": list(reversed(logs)), 
+            "metrics": {
+                "total_visible": len(logs),
+                "http_requests": total_requests,
+                "security_events": security_events
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to read logs: {e}")
+        return {"error": str(e)}

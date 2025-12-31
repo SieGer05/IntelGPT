@@ -31,7 +31,9 @@ const MessageItem = ({ message }) => {
                ${
                !isAi
                   ? "bg-[#303131] p-4 rounded-2xl rounded-tr-sm text-white"
-                  : "bg-transparent text-white items-start"
+                  : message.isError 
+                     ? "bg-red-500/10 border border-red-500/50 p-4 rounded-2xl rounded-tl-sm text-red-100 items-start"
+                     : "bg-transparent text-white items-start"
                }
             `}
          >

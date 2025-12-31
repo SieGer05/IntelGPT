@@ -16,3 +16,4 @@ __pycache__/
 # ChromaDB / vector databases
 chroma_db/
 *.sqlite3
+backend/logs/

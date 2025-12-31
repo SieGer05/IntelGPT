@@ -1,14 +1,26 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Send } from "lucide-react";
 
 const ChatInput = ({ onSend, disabled, centered }) => {
   const [text, setText] = useState("");
+  const inputRef = useRef(null);
+
+  // Focus on mount
+  useEffect(() => {
+    if (!disabled) {
+      inputRef.current?.focus();
+    }
+  }, [disabled]);
 
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!disabled && text.trim()) {
       onSend(text);
       setText("");
+      // Keep focus
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 0);
     }
   };
 
@@ -29,6 +41,7 @@ const ChatInput = ({ onSend, disabled, centered }) => {
       <div className="max-w-3xl mx-auto">
         <form onSubmit={handleSubmit} className={inputContainerClasses}>
           <input
+            ref={inputRef}
             className="
               w-full
               bg-transparent

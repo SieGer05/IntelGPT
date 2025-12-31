@@ -12,6 +12,7 @@ import re
 from datetime import datetime
 from typing import List, Tuple
 from .exceptions import PromptInjectionException, StructuralViolationException
+import difflib
 
 
 class InputGuard:
@@ -182,29 +183,57 @@ class InputGuard:
         if prompt is None or not prompt.strip():
             raise ValueError("Prompt cannot be empty")
         
-        prompt = prompt.strip()
+        user_input = prompt.strip()
         
         # Layer 0: Length validation (prevent resource exhaustion)
-        if len(prompt) > self.MAX_PROMPT_LENGTH:
-            self._log_security_event("LENGTH_EXCEEDED", f"{len(prompt)} chars")
+        if len(user_input) > self.MAX_PROMPT_LENGTH:
+            self._log_security_event("LENGTH_EXCEEDED", f"{len(user_input)} chars")
             raise StructuralViolationException(
                 message=f"Prompt exceeds maximum length ({self.MAX_PROMPT_LENGTH} chars)",
-                details=f"Received {len(prompt)} characters"
+                details=f"Received {len(user_input)} characters"
             )
         
-        # Layer 1: Blacklist keyword detection
-        lower_prompt = prompt.lower()
+        self._check_blacklist(user_input)
+        self._check_fuzzy_blacklist(user_input) # New Fuzzy Layer
+        self._check_regex_patterns(user_input)
+        self._check_structural_integrity(user_input)
+        return True
+
+    def _check_blacklist(self, text: str) -> None:
+        """Layer 1: Exact Blacklist Matching"""
+        text_lower = text.lower()
         for keyword in self.BLACKLIST_KEYWORDS:
-            if keyword in lower_prompt:
-                self._log_security_event("KEYWORD_BLACKLIST", keyword)
-                raise PromptInjectionException(
-                    message="Forbidden keyword detected",
-                    details=f"Matched: '{keyword}'"
-                )
+            if keyword in text_lower:
+                self._log_security_event("BLACKLIST_MATCH", f"Blocked keyword: {keyword}")
+                raise PromptInjectionException(f"Security Alert: Blocked content detected ({keyword}).")
+
+    def _check_fuzzy_blacklist(self, text: str) -> None:
+        """Layer 1.5: Fuzzy Blacklist Matching (e.g., 'sustem' vs 'system')"""
+        text_lower = text.lower()
+        words = text_lower.split()
         
-        # Layer 2: Regex pattern matching
+        # Check against single-word blacklist items for efficiency mostly, 
+        # but for simplicity we check against all blacklist items that are short phrases too.
+        # Threshold 0.85 means 'sustem' (5/6 matches) = 0.83? No.
+        # sustem vs system: matching 's' 't' 'e' 'm' + 'u'/'y'. 5/6 = 0.833. 
+        # let's set threshold to 0.80 for strict but catching typos.
+        
+        # Let's use a specialized list for fuzzy checking to avoid noise
+        FUZZY_TARGETS = [
+            "system", "prompt", "instruct", "ignore", "bypass", "jailbreak", "rule", "guideline"
+        ]
+        
+        for word in words:
+            matches = difflib.get_close_matches(word, FUZZY_TARGETS, n=1, cutoff=0.8)
+            if matches:
+                matched_term = matches[0]
+                self._log_security_event("FUZZY_MATCH", f"Suspicious term detected: '{word}' (similar to '{matched_term}')")
+                raise PromptInjectionException(f"Security Alert: Suspicious terminology detected ('{word}').")
+
+    def _check_regex_patterns(self, text: str) -> None:
+        """Layer 2: Regex Pattern Matching"""
         for pattern_name, pattern in self.MALICIOUS_PATTERNS:
-            if pattern.search(prompt):
+            if pattern.search(text):
                 self._log_security_event("PATTERN_MATCH", pattern_name)
                 raise PromptInjectionException(
                     message="Suspicious pattern detected",
@@ -212,11 +241,11 @@ class InputGuard:
                 )
         
         # Layer 3: Structural analysis
-        self._validate_structure(prompt)
+        # self._check_structural_integrity(text) # Already called in validate()
         
         return True
     
-    def _validate_structure(self, prompt: str) -> None:
+    def _check_structural_integrity(self, prompt: str) -> None:
         """
         Analyzes prompt structure for anomalies.
         
