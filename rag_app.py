@@ -177,9 +177,44 @@ def main():
                print(f"\n{Colors.CYAN}{hybrid_engine.explain_search(query_to_explain)}{Colors.ENDC}\n")
             continue
          
+         # --- QUERY CONTEXTUALIZATION (Resolve pronouns using history) ---
+         search_query = user_query
+         if history:
+            print_status("Contextualizing query based on conversation history...", "info")
+            history_block = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-6:]])
+            
+            rewrite_prompt = f"""
+            Analyze the user's query and the conversation history to resolve any references.
+            
+            RULES:
+            1. If the query contains pronouns like "it", "this", "that", "its", "they", "them" referring to something in history, replace them with the specific terms.
+            2. If the query asks about "sub-techniques", "related techniques", "examples", "more details" - ADD the topic from history.
+            3. If the query is a NEW TOPIC unrelated to history, return the query AS-IS.
+            4. "What is X?" where X is a clear NEW concept is a NEW TOPIC - don't add history context.
+            
+            History:
+            {history_block}
+            
+            User Query: {user_query}
+            
+            Output ONLY the rewritten query string (or original if it's a new topic). Nothing else.
+            """
+            
+            try:
+               rewrite_completion = groq_client.chat.completions.create(
+                  messages=[{"role": "user", "content": rewrite_prompt}],
+                  model=GROQ_MODEL,
+                  temperature=0.1
+               )
+               search_query = rewrite_completion.choices[0].message.content.strip()
+               if search_query != user_query:
+                  print_status(f"Rewritten: '{user_query}' -> '{search_query}'", "info")
+            except Exception as e:
+               print_status(f"Query rewrite failed, using original: {e}", "warning")
+         
          # Detect specific IDs for exact matching
-         cve_match = re.search(r"(CVE-\d{4}-\d{4,7})", user_query, re.IGNORECASE)
-         mitre_match = re.search(r"(T\d{4}(?:\.\d{3})?)", user_query, re.IGNORECASE)
+         cve_match = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
+         mitre_match = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
          
          where_filter = None
          if cve_match:
@@ -196,7 +231,7 @@ def main():
             # Exact ID search
             print_status("Searching with exact ID filter...", "search")
             results = hybrid_engine.search(
-               query=user_query,
+               query=search_query,
                n_results=5,
                where_filter=where_filter,
                search_mode="hybrid",
@@ -206,7 +241,7 @@ def main():
             # Fallback if not found
             if not results['documents'] or not results['documents'][0]:
                print_status("ID not found, expanding search...", "warning")
-               query_variants = expand_query(groq_client, user_query)
+               query_variants = expand_query(groq_client, search_query)
                results = hybrid_engine.multi_query_search(
                   queries=query_variants,
                   n_results=5,
@@ -216,7 +251,7 @@ def main():
          else:
             # Multi-query hybrid search
             print_status("Generating query variants...", "search")
-            query_variants = expand_query(groq_client, user_query)
+            query_variants = expand_query(groq_client, search_query)
             print_status(f"Searching with {len(query_variants)} query variants...", "search")
             
             results = hybrid_engine.multi_query_search(

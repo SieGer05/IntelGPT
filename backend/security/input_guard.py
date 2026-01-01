@@ -219,11 +219,18 @@ class InputGuard:
         # let's set threshold to 0.80 for strict but catching typos.
         
         # Let's use a specialized list for fuzzy checking to avoid noise
+        # NOTE: Removed "bypass" - too many false positives for educational security questions
+        #       like "how do attackers bypass antivirus?"
         FUZZY_TARGETS = [
-            "system", "prompt", "instruct", "ignore", "bypass", "jailbreak", "rule", "guideline"
+            "jailbreak"  # Only truly dangerous isolated terms
         ]
         
+        # These terms are only suspicious in specific contexts (instruction manipulation)
+        # Not when used in educational cybersecurity questions
+        CONTEXT_SENSITIVE_TERMS = ["system", "prompt", "instruct", "ignore", "rule", "guideline"]
+        
         for word in words:
+            # Check dangerous isolated terms
             matches = difflib.get_close_matches(word, FUZZY_TARGETS, n=1, cutoff=0.8)
             if matches:
                 matched_term = matches[0]

@@ -399,8 +399,10 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
          Return a JSON object with these fields:
          1. "intent": "technical" (if it's about cybersecurity, attacks, MITRE, or definitions) OR "general" (if it's greeting, small talk, or thanks).
          2. "safe": true (if safe) or false (if asking for malware code/exploits).
+         3. "sub_questions": an array of distinct sub-questions if the query contains multiple separate questions. If only one question, return an empty array [].
          
-         Example JSON: {{"intent": "general", "safe": true}}
+         Example for single question: {{"intent": "technical", "safe": true, "sub_questions": []}}
+         Example for multiple questions: {{"intent": "technical", "safe": true, "sub_questions": ["What is phishing?", "What is ransomware?"]}}
       """
 
       router_completion = groq_client.chat.completions.create(
@@ -415,6 +417,7 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
       analysis = json.loads(router_completion.choices[0].message.content)
       intent = analysis.get("intent", "general")
       is_safe = analysis.get("safe", True)
+      sub_questions = analysis.get("sub_questions", [])
 
       if not is_safe:
          return QueryResponse(
@@ -426,167 +429,257 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
       sources = []
       system_prompt = ""
       applied_filters = None  # Initialize for both paths
+      
+      # --- MULTI-QUESTION SUPPORT ---
+      # If the query contains multiple sub-questions, we'll search for each and combine contexts
+      queries_to_search = []
+      if sub_questions and len(sub_questions) > 1:
+         print(f"[MULTI-QUESTION] Detected {len(sub_questions)} sub-questions: {sub_questions}")
+         queries_to_search = sub_questions
+      else:
+         queries_to_search = [user_query]
 
       # Step 2: Branching
       if intent == "technical":
          # >> PATH A: TECHNICAL (RAG)
          
-         # --- ENHANCEMENT START: Contextualization ---
-         # Default search query is the user query
-         search_query = user_query
+         # --- PROCESS EACH SUB-QUESTION (or the single query) ---
+         all_context_texts = []
          
-         # If we have history, rewrite the query to include context
-         if history:
-            print("[REWRITE] Contextualizing query based on history...")
-            history_block = "\n".join([f"{msg.role}: {msg.content}" for msg in history])
+         for q_idx, current_query in enumerate(queries_to_search):
+            print(f"[QUERY {q_idx + 1}/{len(queries_to_search)}] Processing: {current_query}")
             
-            rewrite_prompt = f"""
-            Given the conversation history, rewrite the user's last query to be a standalone search query.
-            Replace pronouns (like "it", "this attack", "that") with the specific terms from the history.
-            Output ONLY the rewritten query string. Nothing else.
+            # --- ENHANCEMENT START: Contextualization ---
+            # Default search query is the current query
+            search_query = current_query
             
-            History:
-            {history_block}
-            
-            User Query: {user_query}
-            
-            Rewritten Query:
-            """
-            
-            rewrite_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": rewrite_prompt}],
-            model=GROQ_MODEL,
-            temperature=0.1
-            )
-            
-            search_query = rewrite_completion.choices[0].message.content.strip()
-            print(f"[REWRITE] Original: '{user_query}' -> New: '{search_query}'")
-         # --- ENHANCEMENT END ---
-
-         # --- MULTI-QUERY EXPANSION START ---
-         # Generate semantic variants of the query for better coverage
-         query_variants = [search_query]  # Always include original
-         
-         # Only expand if query is conceptual (not an ID lookup)
-         cve_check = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
-         mitre_check = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
-         
-         if not cve_check and not mitre_check:
-            print("[MULTI-QUERY] Generating query variants for better coverage...")
-            
-            expansion_prompt = f"""
-            Generate 2 alternative search queries for the following cybersecurity question.
-            Each variant should use different terminology or phrasing while preserving the original meaning.
-            
-            Original query: "{search_query}"
-            
-            Rules:
-            - Use synonyms and related technical terms
-            - Keep queries concise (under 15 words)
-            - Focus on different aspects of the same concept
-            - Output ONLY the 2 queries, one per line, no numbering or bullets
-            """
-            
-            try:
-               expansion_completion = groq_client.chat.completions.create(
-                  messages=[{"role": "user", "content": expansion_prompt}],
-                  model=GROQ_MODEL,
-                  temperature=0.7,
-                  max_tokens=150
+            # If we have history, rewrite the query to include context
+            if history:
+               print("[REWRITE] Contextualizing query based on history...")
+               history_block = "\n".join([f"{msg.role}: {msg.content}" for msg in history])
+               
+               rewrite_prompt = f"""
+               Analyze the user's query and the conversation history to resolve any references.
+               
+               RULES:
+               1. PRONOUN RESOLUTION: If the query contains pronouns like "it", "this", "that", "its", "they", "them", "the technique", "the attack", "the vulnerability" referring to something in history, replace them with the specific terms.
+                  Example: History discusses "phishing" + Query "How does it work?" → "How does phishing work?"
+                  Example: History discusses "CVE-2024-1234" + Query "Is it still exploited?" → "Is CVE-2024-1234 still exploited?"
+               2. FOLLOW-UP QUESTIONS: If the query asks about "sub-techniques", "related techniques", "examples", "more details", "mitigations", "detections" - ADD the topic AND technique ID from history.
+                  Example: History mentions "phishing (T1566)" + Query "What are the sub-techniques?" → "What are the sub-techniques of phishing T1566?"
+                  Example: History mentions "credential dumping T1003" + Query "Show me examples" → "Show me examples of credential dumping T1003"
+                  Example: History mentions "ransomware" + Query "How to detect it?" → "How to detect ransomware?"
+               3. TECHNIQUE IDs: ALWAYS include the technique ID (like T1566, T1003) or CVE ID if mentioned in history and the query is a follow-up.
+               4. NEW TOPICS: If the query is a NEW TOPIC unrelated to history (e.g., "What is ransomware?" after discussing phishing), return the query AS-IS.
+               5. EXPLICIT CONCEPTS: "What is X?" where X is a clear NEW concept is usually a NEW TOPIC - don't add history context.
+               6. COMPARATIVE QUERIES: If user asks to compare ("compare it to X", "what's the difference"), include both subjects from history and query.
+               
+               History:
+               {history_block}
+               
+               User Query: {current_query}
+               
+               Output ONLY the rewritten query string (or original if it's a new topic). Nothing else.
+               
+               Rewritten Query:
+               """
+               
+               rewrite_completion = groq_client.chat.completions.create(
+               messages=[{"role": "user", "content": rewrite_prompt}],
+               model=GROQ_MODEL,
+               temperature=0.1
                )
                
-               expanded = expansion_completion.choices[0].message.content.strip()
-               new_variants = [v.strip() for v in expanded.split('\n') if v.strip()][:2]
-               query_variants.extend(new_variants)
-               print(f"[MULTI-QUERY] Variants: {query_variants}")
-            except Exception as e:
-               print(f"[MULTI-QUERY] Expansion failed, using original query only: {e}")
-         # --- MULTI-QUERY EXPANSION END ---
+               search_query = rewrite_completion.choices[0].message.content.strip()
+               
+               # If the rewritten query is very different from original and doesn't contain original terms,
+               # it might be over-contextualized - fallback to original for standalone concepts
+               original_terms = set(current_query.lower().split())
+               rewritten_terms = set(search_query.lower().split())
+               
+               # Check if this looks like a new topic (e.g., "what is phishing")
+               new_topic_patterns = [
+                   r"^what\s+is\s+\w+",
+                   r"^explain\s+\w+",
+                   r"^define\s+\w+",
+                   r"^tell\s+me\s+about\s+\w+"
+               ]
+               is_new_topic_query = any(re.match(p, current_query.lower()) for p in new_topic_patterns)
+               
+               # If query looks like new topic but rewrite added unrelated CVE/context, use original
+               if is_new_topic_query and ("cve" in search_query.lower() or "vulnerability" in search_query.lower()):
+                   if "cve" not in current_query.lower() and "vulnerability" not in current_query.lower():
+                       print(f"[REWRITE] Detected over-contextualization, using original query")
+                       search_query = current_query
+               
+               print(f"[REWRITE] Original: '{current_query}' -> New: '{search_query}'")
+            # --- ENHANCEMENT END ---
 
-         print(f"[PATH] Technical Query -> Searching Database for: {search_query}")
+            # --- MULTI-QUERY EXPANSION START ---
+            # Generate semantic variants of the query for better coverage
+            query_variants = [search_query]  # Always include original
+            
+            # Only expand if query is conceptual (not an ID lookup)
+            cve_check = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
+            mitre_check = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
+            
+            if not cve_check and not mitre_check:
+               print("[MULTI-QUERY] Generating query variants for better coverage...")
+               
+               expansion_prompt = f"""
+               Generate 2 alternative search queries for the following cybersecurity question.
+               Each variant should use different terminology or phrasing while preserving the original meaning.
+               
+               Original query: "{search_query}"
+               
+               Rules:
+               - Use synonyms and related technical terms
+               - Keep queries concise (under 15 words)
+               - Focus on different aspects of the same concept
+               - Output ONLY the 2 queries, one per line, no numbering or bullets
+               """
+               
+               try:
+                  expansion_completion = groq_client.chat.completions.create(
+                     messages=[{"role": "user", "content": expansion_prompt}],
+                     model=GROQ_MODEL,
+                     temperature=0.7,
+                     max_tokens=150
+                  )
+                  
+                  expanded = expansion_completion.choices[0].message.content.strip()
+                  new_variants = [v.strip() for v in expanded.split('\n') if v.strip()][:2]
+                  query_variants.extend(new_variants)
+                  print(f"[MULTI-QUERY] Variants: {query_variants}")
+               except Exception as e:
+                  print(f"[MULTI-QUERY] Expansion failed, using original query only: {e}")
+            # --- MULTI-QUERY EXPANSION END ---
 
-         # --- SMART RETRIEVAL LOGIC START ---
-         # Detect specific IDs (CVE or MITRE) to use deterministic filtering
-         cve_match = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
-         mitre_match = re.search(r"(T\d{4}(?:\.\d{3})?)", search_query, re.IGNORECASE)
-         
-         # Start with dynamic filters from request
-         where_filter = build_chromadb_filter(request.filters)
-         applied_filters = request.filters.model_dump(exclude_none=True) if request.filters else None
-         
-         if cve_match:
-            target_id = cve_match.group(1).upper()
-            print(f"[SMART SEARCH] Exact CVE detected: {target_id}")
-            # Merge with existing filters using $and
-            id_filter = {"external_id": target_id}
+            print(f"[PATH] Technical Query -> Searching Database for: {search_query}")
+
+            # --- SMART RETRIEVAL LOGIC START ---
+            # Detect specific IDs (CVE or MITRE) to use deterministic filtering
+            cve_match = re.search(r"(CVE-\d{4}-\d{4,7})", search_query, re.IGNORECASE)
+            mitre_match = re.search(r"(T\d{4})(?:\.(\d{3}))?", search_query, re.IGNORECASE)
+            
+            # Detect sub-technique queries (general pattern)
+            is_subtechnique_query = bool(re.search(r"sub[- ]?techniques?", search_query, re.IGNORECASE))
+            
+            # Start with dynamic filters from request
+            where_filter = build_chromadb_filter(request.filters)
+            applied_filters = request.filters.model_dump(exclude_none=True) if request.filters else None
+            
+            if cve_match:
+               target_id = cve_match.group(1).upper()
+               print(f"[SMART SEARCH] Exact CVE detected: {target_id}")
+               id_filter = {"external_id": target_id}
+               if where_filter:
+                  where_filter = {"$and": [where_filter, id_filter]}
+               else:
+                  where_filter = id_filter
+              
+            elif mitre_match:
+               parent_id = mitre_match.group(1).upper()
+               sub_id = mitre_match.group(2)  # May be None
+               
+               if is_subtechnique_query and not sub_id:
+                  # Query asks for sub-techniques of a parent technique
+                  # Use parent_technique_id field to find all children
+                  print(f"[SMART SEARCH] Sub-technique query - filtering by parent: {parent_id}")
+                  parent_filter = {"parent_technique_id": parent_id}
+                  if where_filter:
+                     where_filter = {"$and": [where_filter, parent_filter]}
+                  else:
+                     where_filter = parent_filter
+               else:
+                  # Exact MITRE ID lookup
+                  target_id = f"{parent_id}.{sub_id}" if sub_id else parent_id
+                  print(f"[SMART SEARCH] Exact MITRE ID detected: {target_id}")
+                  id_filter = {"external_id": target_id}
+                  if where_filter:
+                     where_filter = {"$and": [where_filter, id_filter]}
+                  else:
+                     where_filter = id_filter
+            
+            elif is_subtechnique_query:
+               # Sub-technique query without explicit technique ID
+               # Try to extract technique ID from the rewritten query or use semantic search
+               print(f"[SMART SEARCH] Sub-technique query without explicit ID - using semantic search with subtechnique filter")
+               # Filter to only return sub-techniques (is_subtechnique = "true")
+               subtechnique_filter = {"is_subtechnique": "true"}
+               if where_filter:
+                  where_filter = {"$and": [where_filter, subtechnique_filter]}
+               else:
+                  where_filter = subtechnique_filter
+            
+            # Log applied filters
+            if applied_filters:
+               print(f"[DYNAMIC FILTERS] Applying user filters: {applied_filters}")
+
+            # --- HYBRID SEARCH (Vector + BM25) WITH MULTI-QUERY ---
+            results = {'documents': [], 'metadatas': []}
+
+            # Execute Hybrid Search
             if where_filter:
-               where_filter = {"$and": [where_filter, id_filter]}
+               # Case 1: Smart Filter Active (exact ID match) - use single query
+               print(f"[HYBRID SEARCH] Using filter mode for exact ID match")
+               results = hybrid_search_engine.search(
+                  query=search_query,
+                  n_results=5,
+                  where_filter=where_filter,
+                  search_mode="hybrid",
+                  min_score_threshold=0.1  # Apply threshold
+               )
+               # Fallback if filter returns nothing
+               if not results['documents'] or not results['documents'][0]:
+                  print("[HYBRID SEARCH] ID not found, falling back to full hybrid search...")
+                  results = hybrid_search_engine.multi_query_search(
+                     queries=query_variants,
+                     n_results=10,
+                     search_mode="hybrid",
+                     min_score_threshold=0.05
+                  )
             else:
-               where_filter = id_filter
-             
-         elif mitre_match:
-            target_id = mitre_match.group(1).upper()
-            print(f"[SMART SEARCH] Exact MITRE ID detected: {target_id}")
-            # Merge with existing filters using $and
-            id_filter = {"external_id": target_id}
-            if where_filter:
-               where_filter = {"$and": [where_filter, id_filter]}
-            else:
-               where_filter = id_filter
-         
-         # Log applied filters
-         if applied_filters:
-            print(f"[DYNAMIC FILTERS] Applying user filters: {applied_filters}")
-
-         # --- HYBRID SEARCH (Vector + BM25) WITH MULTI-QUERY ---
-         results = {'documents': [], 'metadatas': []}
-
-         # Execute Hybrid Search
-         if where_filter:
-            # Case 1: Smart Filter Active (exact ID match) - use single query
-            print(f"[HYBRID SEARCH] Using filter mode for exact ID match")
-            results = hybrid_search_engine.search(
-               query=search_query,
-               n_results=5,
-               where_filter=where_filter,
-               search_mode="hybrid",
-               min_score_threshold=0.1  # Apply threshold
-            )
-            # Fallback if filter returns nothing
-            if not results['documents'] or not results['documents'][0]:
-               print("[HYBRID SEARCH] ID not found, falling back to full hybrid search...")
+               # Case 2: Full Multi-Query Hybrid Search (Vector + BM25)
+               print(f"[HYBRID SEARCH] Combining Vector + BM25 with {len(query_variants)} query variants")
                results = hybrid_search_engine.multi_query_search(
                   queries=query_variants,
                   n_results=10,
                   search_mode="hybrid",
-                  min_score_threshold=0.05
+                  min_score_threshold=0.05  # Filter low-quality results
                )
-         else:
-            # Case 2: Full Multi-Query Hybrid Search (Vector + BM25)
-            print(f"[HYBRID SEARCH] Combining Vector + BM25 with {len(query_variants)} query variants")
-            results = hybrid_search_engine.multi_query_search(
-               queries=query_variants,
-               n_results=10,
-               search_mode="hybrid",
-               min_score_threshold=0.05  # Filter low-quality results
-            )
-         
-         # Log search performance
-         print(f"[HYBRID SEARCH] Vector results: {results.get('vector_results_count', 0)}, BM25 results: {results.get('bm25_results_count', 0)}, Reranked: {results.get('reranked', False)}")
-         if results.get('query_count'):
-            print(f"[MULTI-QUERY] Used {results.get('query_count')} queries, found {results.get('unique_docs_found', 0)} unique docs")
-         # --- END HYBRID SEARCH ---
+            
+            # Log search performance
+            print(f"[HYBRID SEARCH] Vector results: {results.get('vector_results_count', 0)}, BM25 results: {results.get('bm25_results_count', 0)}, Reranked: {results.get('reranked', False)}")
+            if results.get('query_count'):
+               print(f"[MULTI-QUERY] Used {results.get('query_count')} queries, found {results.get('unique_docs_found', 0)} unique docs")
+            # --- END HYBRID SEARCH ---
 
-         if results['documents'] and results['documents'][0]:
-            for i in range(len(results['documents'][0])):
-               doc = results['documents'][0][i]
-               meta = results['metadatas'][0][i]
-               
-               source_id = f"{meta['name']} ({meta.get('external_id', 'N/A')})"
-               # Prevent duplicates in source list
-               if source_id not in sources:
-                  sources.append(source_id)
-               context_text += f"---\nSOURCE: {source_id}\nCONTENT: {doc}\n"
+            # Accumulate context for this sub-question
+            sub_context = ""
+            if results['documents'] and results['documents'][0]:
+               for i in range(len(results['documents'][0])):
+                  doc = results['documents'][0][i]
+                  meta = results['metadatas'][0][i]
+                  
+                  source_id = f"{meta['name']} ({meta.get('external_id', 'N/A')})"
+                  # Prevent duplicates in source list
+                  if source_id not in sources:
+                     sources.append(source_id)
+                  sub_context += f"---\nSOURCE: {source_id}\nCONTENT: {doc}\n"
+            
+            if sub_context:
+               # Label context by sub-question if multiple questions
+               if len(queries_to_search) > 1:
+                  all_context_texts.append(f"=== CONTEXT FOR: {current_query} ===\n{sub_context}")
+               else:
+                  all_context_texts.append(sub_context)
+         
+         # --- END OF SUB-QUESTION LOOP ---
+         
+         # Combine all contexts
+         if all_context_texts:
+            context_text = "\n".join(all_context_texts)
          else:
             context_text = "No specific cybersecurity documents found in database."
          
@@ -594,6 +687,7 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
          You are a Cyber Threat Intelligence Expert.
          Use ONLY the following context to answer the user's question.
          If the answer is not in the context, say "I don't have enough information in my database."
+         {"The user asked multiple questions - answer each one using the relevant context sections." if len(queries_to_search) > 1 else ""}
          
          CONTEXT:
          {context_text}
