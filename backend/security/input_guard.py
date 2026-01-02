@@ -85,7 +85,7 @@ class InputGuard:
     MALICIOUS_PATTERNS: List[Tuple[str, re.Pattern]] = [
         # Instruction Override Patterns
         ("INSTRUCTION_OVERRIDE", re.compile(
-            r"(?i)\b(ignore|disregard|forget|skip|bypass)\s+(all|previous|above|prior|my|every)\s+(instructions?|rules?|guidelines?|commands?|restrictions?)",
+            r"(?i)\b(ignore|disregard|forget|skip|bypass)\s+(\w+\s+)*(all|previous|above|prior|every)?\s*(instructions?|rules?|guidelines?|commands?|restrictions?)",
             re.IGNORECASE
         )),
         ("NEW_INSTRUCTIONS", re.compile(
@@ -137,6 +137,16 @@ class InputGuard:
         # Context Escape Attempts
         ("CONTEXT_ESCAPE", re.compile(
             r"(?i)(end\s+of\s+context|context\s+ends?|stop\s+context|exit\s+context)",
+            re.IGNORECASE
+        )),
+        
+        # Malware/Exploit Generation Requests
+        ("MALWARE_REQUEST", re.compile(
+            r"(?i)(create|write|generate|make|build|code|develop)\s+(\w+\s+)*(ransomware|malware|virus|trojan|keylogger|rootkit|backdoor|exploit|worm|spyware)",
+            re.IGNORECASE
+        )),
+        ("EXPLOIT_HOW_TO", re.compile(
+            r"(?i)how\s+to\s+(\w+\s+)*(create|write|make|build|develop)\s+(\w+\s+)*(ransomware|malware|virus|trojan|keylogger|rootkit|backdoor|exploit)",
             re.IGNORECASE
         )),
     ]

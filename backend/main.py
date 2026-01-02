@@ -217,6 +217,10 @@ def build_chromadb_filter(filters: Optional[DynamicFilters]) -> Optional[dict]:
    """
    Build ChromaDB where filter from DynamicFilters.
    Supports AND logic with multiple conditions.
+   
+   Note: Tactics and platforms use comma-separated strings in metadata,
+   which cannot be filtered with ChromaDB operators. These are handled
+   by post_filter_results() instead.
    """
    if not filters:
       return None
@@ -235,23 +239,9 @@ def build_chromadb_filter(filters: Optional[DynamicFilters]) -> Optional[dict]:
    if filters.is_subtechnique is not None:
       conditions.append({"is_subtechnique": filters.is_subtechnique})
    
-   # Tactics filter (contains any - stored as comma-separated string)
-   if filters.tactics and len(filters.tactics) > 0:
-      # ChromaDB uses $contains for substring match in string fields
-      # For multiple tactics, we create OR conditions
-      if len(filters.tactics) == 1:
-         conditions.append({"tactics": {"$contains": filters.tactics[0]}})
-      else:
-         tactic_conditions = [{"tactics": {"$contains": t}} for t in filters.tactics]
-         conditions.append({"$or": tactic_conditions})
-   
-   # Platforms filter (contains any - stored as comma-separated string)
-   if filters.platforms and len(filters.platforms) > 0:
-      if len(filters.platforms) == 1:
-         conditions.append({"platforms": {"$contains": filters.platforms[0]}})
-      else:
-         platform_conditions = [{"platforms": {"$contains": p}} for p in filters.platforms]
-         conditions.append({"$or": platform_conditions})
+   # NOTE: Tactics and platforms are comma-separated strings in metadata.
+   # ChromaDB doesn't support substring matching, so we use post-filtering.
+   # See post_filter_results() below.
    
    # Combine with AND logic
    if len(conditions) == 0:
@@ -260,6 +250,80 @@ def build_chromadb_filter(filters: Optional[DynamicFilters]) -> Optional[dict]:
       return conditions[0]
    else:
       return {"$and": conditions}
+
+
+def post_filter_results(results: dict, filters: Optional[DynamicFilters]) -> dict:
+   """
+   Apply post-filtering for fields that cannot be filtered in ChromaDB.
+   This handles tactics and platforms which are stored as comma-separated strings.
+   
+   Args:
+      results: Search results dict with 'documents', 'metadatas', 'ids' keys
+      filters: DynamicFilters with tactics and platforms lists
+   
+   Returns:
+      Filtered results dict with same structure
+   """
+   if not filters:
+      return results
+   
+   # Check if there are any post-filters to apply
+   has_tactics_filter = filters.tactics and len(filters.tactics) > 0
+   has_platforms_filter = filters.platforms and len(filters.platforms) > 0
+   
+   if not has_tactics_filter and not has_platforms_filter:
+      return results
+   
+   # No results to filter
+   if not results.get('documents') or not results['documents'][0]:
+      return results
+   
+   # Build filtered indices
+   filtered_indices = []
+   
+   for i, meta in enumerate(results['metadatas'][0]):
+      include = True
+      
+      # Check tactics filter (comma-separated string)
+      if has_tactics_filter:
+         doc_tactics = meta.get('tactics', '') or ''
+         doc_tactics_list = [t.strip().lower() for t in doc_tactics.split(',') if t.strip()]
+         filter_tactics_lower = [t.lower() for t in filters.tactics]
+         # Check if any filter tactic matches any document tactic
+         if not any(ft in doc_tactics_list for ft in filter_tactics_lower):
+            include = False
+      
+      # Check platforms filter (comma-separated string)
+      if include and has_platforms_filter:
+         doc_platforms = meta.get('platforms', '') or ''
+         doc_platforms_list = [p.strip().lower() for p in doc_platforms.split(',') if p.strip()]
+         filter_platforms_lower = [p.lower() for p in filters.platforms]
+         # Check if any filter platform matches any document platform
+         if not any(fp in doc_platforms_list for fp in filter_platforms_lower):
+            include = False
+      
+      if include:
+         filtered_indices.append(i)
+   
+   # Build filtered results
+   filtered_results = {
+      'documents': [[results['documents'][0][i] for i in filtered_indices]],
+      'metadatas': [[results['metadatas'][0][i] for i in filtered_indices]],
+      'ids': [[results['ids'][0][i] for i in filtered_indices]] if results.get('ids') else None,
+      'distances': [[results['distances'][0][i] for i in filtered_indices]] if results.get('distances') else None,
+   }
+   
+   # Preserve other fields from original results
+   for key in results:
+      if key not in filtered_results:
+         filtered_results[key] = results[key]
+   
+   # Add filter stats
+   filtered_results['post_filtered'] = True
+   filtered_results['original_count'] = len(results['documents'][0])
+   filtered_results['filtered_count'] = len(filtered_indices)
+   
+   return filtered_results
 
 
 # FILTER OPTIONS ENDPOINT
@@ -324,16 +388,31 @@ async def search_endpoint(request: SearchRequest):
       where_filter = build_chromadb_filter(request.filters)
       applied_filters = None
       
-      if where_filter:
+      # Check if post-filtering is needed (for tactics/platforms)
+      needs_post_filter = request.filters and (
+         (request.filters.tactics and len(request.filters.tactics) > 0) or
+         (request.filters.platforms and len(request.filters.platforms) > 0)
+      )
+      
+      if where_filter or needs_post_filter:
          print(f"[SEARCH] Applying dynamic filters: {request.filters}")
          applied_filters = request.filters.model_dump(exclude_none=True) if request.filters else None
       
+      # Fetch more results if post-filtering is needed
+      fetch_count = request.n_results * 3 if needs_post_filter else request.n_results
+      
       results = hybrid_search_engine.search(
          query=request.query,
-         n_results=request.n_results,
+         n_results=fetch_count,
          search_mode=request.search_mode,
          where_filter=where_filter
       )
+      
+      # Apply post-filtering for tactics/platforms (comma-separated fields)
+      if needs_post_filter:
+         results = post_filter_results(results, request.filters)
+         if results.get('post_filtered'):
+            print(f"[SEARCH] Post-filtered: {results.get('original_count')} -> {results.get('filtered_count')} results")
       
       formatted_results = []
       for i, doc_id in enumerate(results["ids"][0]):
@@ -615,39 +694,60 @@ async def chat_endpoint(request: QueryRequest, raw_request: Request):
             # Log applied filters
             if applied_filters:
                print(f"[DYNAMIC FILTERS] Applying user filters: {applied_filters}")
+            
+            # Check if post-filtering is needed (for tactics/platforms)
+            needs_post_filter = request.filters and (
+               (request.filters.tactics and len(request.filters.tactics) > 0) or
+               (request.filters.platforms and len(request.filters.platforms) > 0)
+            )
 
             # --- HYBRID SEARCH (Vector + BM25) WITH MULTI-QUERY ---
-            results = {'documents': [], 'metadatas': []}
+            results = {'documents': [], 'metadatas': [], 'ids': []}
+            
+            # Fetch more results if post-filtering is needed
+            base_results = 5 if where_filter else 10
+            fetch_count = base_results * 3 if needs_post_filter else base_results
 
             # Execute Hybrid Search
             if where_filter:
                # Case 1: Smart Filter Active (exact ID match) - use single query
                print(f"[HYBRID SEARCH] Using filter mode for exact ID match")
+               # Disable threshold when post-filtering is needed
+               threshold = 0.0 if needs_post_filter else 0.1
                results = hybrid_search_engine.search(
                   query=search_query,
-                  n_results=5,
+                  n_results=fetch_count,
                   where_filter=where_filter,
                   search_mode="hybrid",
-                  min_score_threshold=0.1  # Apply threshold
+                  min_score_threshold=threshold
                )
                # Fallback if filter returns nothing
                if not results['documents'] or not results['documents'][0]:
                   print("[HYBRID SEARCH] ID not found, falling back to full hybrid search...")
+                  fallback_threshold = 0.0 if needs_post_filter else 0.05
                   results = hybrid_search_engine.multi_query_search(
                      queries=query_variants,
-                     n_results=10,
+                     n_results=fetch_count * 2,
                      search_mode="hybrid",
-                     min_score_threshold=0.05
+                     min_score_threshold=fallback_threshold
                   )
             else:
                # Case 2: Full Multi-Query Hybrid Search (Vector + BM25)
                print(f"[HYBRID SEARCH] Combining Vector + BM25 with {len(query_variants)} query variants")
+               # Disable threshold when post-filtering is needed to get more candidates
+               threshold = 0.0 if needs_post_filter else 0.05
                results = hybrid_search_engine.multi_query_search(
                   queries=query_variants,
-                  n_results=10,
+                  n_results=fetch_count,
                   search_mode="hybrid",
-                  min_score_threshold=0.05  # Filter low-quality results
+                  min_score_threshold=threshold
                )
+            
+            # Apply post-filtering for tactics/platforms (comma-separated fields)
+            if needs_post_filter:
+               results = post_filter_results(results, request.filters)
+               if results.get('post_filtered'):
+                  print(f"[POST-FILTER] Filtered: {results.get('original_count')} -> {results.get('filtered_count')} results")
             
             # Log search performance
             print(f"[HYBRID SEARCH] Vector results: {results.get('vector_results_count', 0)}, BM25 results: {results.get('bm25_results_count', 0)}, Reranked: {results.get('reranked', False)}")
